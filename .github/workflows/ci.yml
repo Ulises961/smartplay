@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+          components: clippy, rustfmt
+      - run: ./scripts/fetch-deps.sh
+      - run: rustfmt --edition 2021 --check $(git ls-files 'crates/**/*.rs')
+      - run: cargo test -p smartplay-core
+      - run: cargo clippy -p smartplay-core -p smartplay-engine -- -D warnings
+      - run: cargo build -p smartplay-engine
+      - run: cargo build -p smartplay-plugin --release --target wasm32-wasip1

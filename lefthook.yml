@@ -1,0 +1,67 @@
+# Local gates. CI (.github/workflows/ci.yml) re-runs the same checks remotely; these exist so a bad
+# commit is refused before it exists. Install once per clone with `lefthook install`.
+
+commit-msg:
+  commands:
+    enforce-format:
+      run: |
+        MSG=$(cat {1})
+        echo "$MSG" | head -n 1 | grep -qE '^(feat|fix|docs|style|refactor|test|chore|perf)(\(.+\))?: .{1,100}$' || {
+          echo "Commit subject does not match conventional commits format."
+          echo "   Expected: type(scope): description"
+          echo "   Types: feat fix docs style refactor test chore perf"
+          echo "   Got: $(echo "$MSG" | head -n 1)"
+          exit 1
+        }
+
+pre-commit:
+  # cargo takes a lock on the build directory, so these run one after another.
+  parallel: false
+  # Refuses a commit on main/master: changes reach main through a pull request. Lives in
+  # .lefthook/pre-commit/, together with what it does not stop.
+  scripts:
+    "default-branch-guard.sh":
+      runner: bash
+  commands:
+    no-secrets:
+      # Scans only the lines being added.
+      run: |
+        if git diff --cached -U0 | grep -E '^\+' | grep -qE 'gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}'; then
+          echo "A staged line looks like a credential (token or private key). Remove it before committing."
+          exit 1
+        fi
+    rust-fmt:
+      glob: "*.rs"
+      # rustfmt on the staged files, not `cargo fmt`: cargo also formats path dependencies, and .deps/pdk
+      # (Navidrome's SDK) is not ours.
+      run: PATH="$HOME/.cargo/bin:$PATH" rustfmt --edition 2021 --check {staged_files}
+    rust-clippy:
+      glob: "{*.rs,Cargo.toml,Cargo.lock}"
+      # The plugin is excluded here: it needs .deps/ (scripts/fetch-deps.sh) and the wasm target.
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo clippy --workspace --exclude smartplay-plugin --all-targets -- -D warnings
+    rust-test:
+      glob: "{*.rs,Cargo.toml,Cargo.lock}"
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo test --workspace --exclude smartplay-plugin
+
+# The push half of the same guard: refuses to update or delete main/master on the remote. pre-push passes the
+# refs being pushed on stdin, which is how the script sees the remote ref.
+pre-push:
+  scripts:
+    "default-branch-guard.sh":
+      runner: bash
+      use_stdin: true
+
+# Everything CI runs, including the WASM plugin. Slower, so not wired to a git hook: run it before pushing
+# with `lefthook run local-verify`.
+local-verify:
+  commands:
+    fetch-deps:
+      run: test -d .deps/pdk || ./scripts/fetch-deps.sh
+    fmt:
+      run: PATH="$HOME/.cargo/bin:$PATH" rustfmt --edition 2021 --check $(git ls-files 'crates/**/*.rs')
+    clippy:
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo clippy --workspace --exclude smartplay-plugin --all-targets -- -D warnings
+    tests:
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo test --workspace --exclude smartplay-plugin
+    plugin-wasm:
+      run: PATH="$HOME/.cargo/bin:$PATH" cargo build -p smartplay-plugin --release --target wasm32-wasip1

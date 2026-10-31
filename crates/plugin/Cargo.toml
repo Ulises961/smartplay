@@ -1,0 +1,15 @@
+[package]
+name = "smartplay-plugin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smartplay-core = { path = "../core" }
+nd-pdk = { path = "../../.deps/pdk/rust/nd-pdk" }
+extism-pdk = "1.2"
+serde_json = "1"

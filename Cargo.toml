@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/plugin", "crates/engine"]
+# .deps/pdk is Navidrome's SDK, fetched by scripts/fetch-deps.sh; not ours to lint or format.
+exclude = [".deps"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+license = "GPL-3.0-or-later"

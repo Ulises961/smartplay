@@ -1,0 +1,25 @@
+{
+  "name": "smartplay",
+  "author": "Ulises961",
+  "version": "0.0.1",
+  "description": "Connects Navidrome to the smartplay engine, which writes a playlist for each user you grant",
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "engine_url": { "type": "string", "title": "Engine address", "description": "For example http://172.17.0.1:7788" },
+        "enrollment_code": { "type": "string", "title": "Enrollment code", "description": "One-time code printed by the engine" }
+      }
+    },
+    "uiSchema": {
+      "enrollment_code": { "ui:widget": "password" }
+    }
+  },
+  "permissions": {
+    "scheduler": { "reason": "Run periodically" },
+    "subsonicapi": { "reason": "Read starred songs and write playlists as the granted users" },
+    "users": { "reason": "Act only for the users the admin granted" },
+    "kvstore": { "reason": "Keep the engine token", "maxSize": "64KB" },
+    "http": { "reason": "Talk to the engine", "requiredHosts": ["172.17.0.1"] }
+  }
+}
