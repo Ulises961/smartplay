@@ -11,9 +11,13 @@ plugin.
   normalization and artist identity resolution (one artist spelled several ways), with tests. It compiles into both the
   engine and the plugin (`wasm32-wasip1`).
 
-The playlist is called `smartplay` and holds the user's starred songs in reverse order. It is written for each granted
-user every minute, by id, so it is updated in place and left alone when nothing changed. smartplay touches no other
-playlist.
+Each granted user gets a playlist called `smartplay`: 50 songs they have not starred, from the artists and genres they
+star most. An artist counts once however the library spells the name, and no artist plays out the whole list. A user
+with no stars gets no playlist. The playlist is checked every minute and written by id, so it is updated in place and
+left alone when nothing changed. smartplay touches no other playlist.
+
+The engine needs each user's library for this. The plugin sends it once, in pages, and again only when Navidrome's scan
+changes the library. The engine keeps one copy per server and user in its data folder.
 
 ## Install
 
@@ -66,8 +70,24 @@ the engine, the plugin drops its token and logs `engine rejected the token`; ent
 
 ## Use
 
-Each granted user finds a playlist named `smartplay` in any Subsonic client within a minute. Grant or withdraw users in
-Navidrome's plugin permissions; nothing runs for a user who is not granted.
+Star songs in any Subsonic client. Within a minute each granted user finds a playlist named `smartplay`. Grant or
+withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
+
+`smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
+example to keep only unplayed songs, or songs of one genre, in random order:
+
+```json
+{
+  "name": "Fresh from smartplay",
+  "all": [
+    { "inPlaylist": { "id": "<id of the smartplay playlist>" } },
+    { "is": { "genre": "Rock" } },
+    { "lt": { "playcount": 1 } }
+  ],
+  "sort": "random",
+  "limit": 10
+}
+```
 
 ## Privacy
 
