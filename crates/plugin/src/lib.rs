@@ -2,7 +2,7 @@ use extism_pdk::*;
 use nd_pdk::host::{http, kvstore, scheduler, subsonicapi, users};
 use nd_pdk::lifecycle::{Error as LifecycleError, InitProvider};
 use nd_pdk::scheduler::{CallbackProvider, Error as SchedulerError, SchedulerCallbackRequest};
-use smartplay_core::{playlist, protocol::*, Subsonic};
+use smartplay_core::{library, playlist, protocol::*, Subsonic};
 
 nd_pdk::register_lifecycle_init!(Smartplay);
 nd_pdk::register_scheduler_callback!(Smartplay);
@@ -79,24 +79,74 @@ fn engine_token(base: &str) -> Result<Option<String>, String> {
     Ok(Some(token))
 }
 
+/// POSTs to the engine with the token and returns the body of a 200 answer.
+fn engine_post(base: &str, path: &str, token: &str, body: &str) -> Result<String, String> {
+    let (status, reply) = post(base, path, Some(token), body)?;
+    match status {
+        200 => Ok(reply),
+        401 => {
+            let _ = kvstore::delete(TOKEN_KEY); // revoked on the engine: ask for a new code
+            Err("engine rejected the token; enroll again with a new code".into())
+        }
+        _ => Err(format!("engine answered {status}")),
+    }
+}
+
+fn ask(base: &str, token: &str, request: &ComputeRequest) -> Result<ComputeResponse, String> {
+    let reply = engine_post(
+        base,
+        "/compute",
+        token,
+        &serde_json::to_string(request).unwrap(),
+    )?;
+    serde_json::from_str(&reply).map_err(|e| e.to_string())
+}
+
+/// Sends the user's library to the engine, one page at a time. Returns the number of songs.
+fn upload_library(base: &str, token: &str, user: &str, fingerprint: &str) -> Result<usize, String> {
+    let mut sent = 0;
+    loop {
+        let songs = library::songs(&HostApi, user, sent)?;
+        let chunk = LibraryChunk {
+            user: user.into(),
+            fingerprint: fingerprint.into(),
+            first: sent == 0,
+            last: songs.len() < library::PAGE,
+            songs,
+        };
+        engine_post(
+            base,
+            "/library",
+            token,
+            &serde_json::to_string(&chunk).unwrap(),
+        )?;
+        sent += chunk.songs.len();
+        if chunk.last {
+            return Ok(sent);
+        }
+    }
+}
+
 fn run_user(base: &str, token: &str, user: &str) -> Result<String, String> {
-    let starred = smartplay_core::starred_ids(&HostApi, user)?;
-    let body = serde_json::to_string(&ComputeRequest {
+    let fingerprint = library::fingerprint(&HostApi, user)?;
+    let request = ComputeRequest {
         user: user.into(),
-        starred,
-    })
-    .unwrap();
-    let (status, reply) = post(base, "/compute", Some(token), &body)?;
-    if status == 401 {
-        let _ = kvstore::delete(TOKEN_KEY); // revoked on the engine: ask for a new code
-        return Err("engine rejected the token; enroll again with a new code".into());
+        starred: smartplay_core::starred_ids(&HostApi, user)?,
+        fingerprint: fingerprint.clone(),
+    };
+    let mut answer = ask(base, token, &request)?;
+    if answer == ComputeResponse::NeedLibrary {
+        let sent = upload_library(base, token, user, &fingerprint)?;
+        info!("smartplay: {user}: library sent to the engine ({sent} songs)");
+        answer = ask(base, token, &request)?;
     }
-    if status != 200 {
-        return Err(format!("engine answered {status}"));
+    match answer {
+        ComputeResponse::Playlist { playlist, songs } => {
+            let outcome = playlist::write_playlist(&HostApi, user, &playlist, &songs)?;
+            Ok(format!("{outcome:?}"))
+        }
+        ComputeResponse::NeedLibrary => Err("the engine asks for the library again".into()),
     }
-    let answer: ComputeResponse = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
-    let outcome = playlist::write_playlist(&HostApi, user, &answer.playlist, &answer.songs)?;
-    Ok(format!("{outcome:?}"))
 }
 
 impl CallbackProvider for Smartplay {
