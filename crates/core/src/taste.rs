@@ -5,16 +5,21 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::identity::{resolve, Decisions, Track};
 use crate::normalize::fold;
 
 /// One song of the library.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Song {
     pub id: String,
     pub artist: String,
     pub album: String,
     pub title: String,
+    #[serde(default)]
     pub genre: Option<String>,
+    #[serde(default)]
     pub artist_mbid: Option<String>,
 }
 
