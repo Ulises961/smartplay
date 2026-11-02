@@ -43,8 +43,21 @@ internet; if the engine runs on another host than Navidrome, put it behind HTTPS
 ```bash
 ./target/release/smartplay-engine servers list              # paired or waiting for enrollment
 ./target/release/smartplay-engine servers add NAME          # another server entry, with a fresh code
-./target/release/smartplay-engine servers remove NAME       # revokes its token at once
+./target/release/smartplay-engine servers remove NAME       # revokes its token at once; deletes its library copies and decisions
 ```
+
+A library often names one artist several ways (`Los Redondos`, `Patricio Rey y sus Redonditos de Ricota`). The engine
+joins the spellings that differ only in case, accents or `&`/`y`/`and`, and the ones with strong evidence; the rest it
+only suggests. You decide the rest, per user, and the decision is kept in the engine's data folder (names in the
+library are never changed):
+
+```bash
+./target/release/smartplay-engine artists list SERVER USER                    # decisions, joined spellings, suggestions
+./target/release/smartplay-engine artists same SERVER USER "NAME" "NAME"      # one artist
+./target/release/smartplay-engine artists different SERVER USER "NAME" "NAME" # two artists, and stop suggesting them
+```
+
+`SERVER` is the name from `servers list`; `USER` is the Navidrome user name. The next playlist uses the decision.
 
 ### Plugin
 
