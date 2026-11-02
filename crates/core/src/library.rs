@@ -18,6 +18,10 @@ struct Body {
     status: String,
     #[serde(default, rename = "scanStatus")]
     scan_status: Option<Scan>,
+    #[serde(default)]
+    artists: Option<Artists>,
+    #[serde(default)]
+    genres: Option<Genres>,
     #[serde(default, rename = "searchResult3")]
     search: Option<Search>,
 }
@@ -26,8 +30,41 @@ struct Body {
 struct Scan {
     #[serde(default)]
     count: u64,
-    #[serde(default, rename = "lastScan")]
-    last_scan: String,
+}
+
+#[derive(Deserialize, Default)]
+struct Artists {
+    #[serde(default)]
+    index: Vec<Index>,
+}
+
+#[derive(Deserialize)]
+struct Index {
+    #[serde(default)]
+    artist: Vec<ArtistRaw>,
+}
+
+#[derive(Deserialize)]
+struct ArtistRaw {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "albumCount")]
+    album_count: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct Genres {
+    #[serde(default)]
+    genre: Vec<GenreRaw>,
+}
+
+#[derive(Deserialize)]
+struct GenreRaw {
+    #[serde(default)]
+    value: String,
+    #[serde(default, rename = "songCount")]
+    song_count: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -59,12 +96,46 @@ fn body(api: &dyn Subsonic, request: &str) -> Result<Body, String> {
     Ok(envelope.response)
 }
 
-/// Changes whenever the server's scan changes the library: the song count and the time of the last scan.
+/// Changes when what taste reads changes, and only then: the song count, each artist with its album count and each genre
+/// with its song count. The time of the last scan is left out on purpose: the server rescans whenever any watched folder
+/// changes, a folder of playlists included, and each such scan would send the whole library again.
 pub fn fingerprint(api: &dyn Subsonic, user: &str) -> Result<String, String> {
-    let scan = body(api, &format!("getScanStatus?u={}", encode(user)))?
+    let u = encode(user);
+    let count = body(api, &format!("getScanStatus?u={u}"))?
         .scan_status
-        .ok_or("the server gave no scan status")?;
-    Ok(format!("{}@{}", scan.count, scan.last_scan))
+        .ok_or("the server gave no scan status")?
+        .count;
+    let artists = body(api, &format!("getArtists?u={u}"))?
+        .artists
+        .unwrap_or_default();
+    let genres = body(api, &format!("getGenres?u={u}"))?
+        .genres
+        .unwrap_or_default();
+
+    let mut lines: Vec<String> = artists
+        .index
+        .iter()
+        .flat_map(|i| &i.artist)
+        .map(|a| format!("a\t{}\t{}\t{}", a.id, a.name, a.album_count))
+        .chain(
+            genres
+                .genre
+                .iter()
+                .map(|g| format!("g\t{}\t{}", g.value, g.song_count)),
+        )
+        .collect();
+    lines.sort();
+    Ok(format!(
+        "{count}-{:016x}",
+        fnv1a(lines.join("\n").as_bytes())
+    ))
+}
+
+/// FNV-1a: a small, dependency-free hash. It only has to tell two libraries apart, not resist anyone.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, b| {
+        (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// The songs of the user's library from `offset`, at most [`PAGE`]. A shorter page than [`PAGE`] is the last one.
@@ -92,13 +163,43 @@ pub fn songs(api: &dyn Subsonic, user: &str, offset: usize) -> Result<Vec<Song>,
 mod tests {
     use super::*;
 
-    /// A server holding `n` songs and a scan status.
-    struct Server(usize);
+    /// A server holding `songs` songs, a scan status, two artists and two genres.
+    struct Server {
+        songs: usize,
+        last_scan: &'static str,
+        artist: &'static str,
+        rock: u32,
+    }
+
+    #[allow(non_snake_case)]
+    fn Server(songs: usize) -> Server {
+        Server {
+            songs,
+            last_scan: "2026-10-31T10:00:00Z",
+            artist: "Queen",
+            rock: 5,
+        }
+    }
 
     impl Subsonic for Server {
         fn call(&self, request: &str) -> Result<String, String> {
             if request.starts_with("getScanStatus") {
-                return Ok(r#"{"subsonic-response":{"status":"ok","scanStatus":{"scanning":false,"count":7,"lastScan":"2026-10-31T10:00:00Z"}}}"#.into());
+                return Ok(format!(
+                    r#"{{"subsonic-response":{{"status":"ok","scanStatus":{{"scanning":false,"count":7,"lastScan":"{}"}}}}}}"#,
+                    self.last_scan
+                ));
+            }
+            if request.starts_with("getArtists") {
+                return Ok(format!(
+                    r#"{{"subsonic-response":{{"status":"ok","artists":{{"index":[{{"name":"Q","artist":[{{"id":"a1","name":"{}","albumCount":3}}]}},{{"name":"A","artist":[{{"id":"a2","name":"ABBA","albumCount":2}}]}}]}}}}}}"#,
+                    self.artist
+                ));
+            }
+            if request.starts_with("getGenres") {
+                return Ok(format!(
+                    r#"{{"subsonic-response":{{"status":"ok","genres":{{"genre":[{{"value":"Rock","songCount":{},"albumCount":2}},{{"value":"Pop","songCount":2,"albumCount":1}}]}}}}}}"#,
+                    self.rock
+                ));
             }
             let value = |key: &str| -> usize {
                 request
@@ -109,7 +210,7 @@ mod tests {
                     .unwrap()
             };
             let (offset, count) = (value("songOffset"), value("songCount"));
-            let songs: Vec<String> = (offset..self.0.min(offset + count))
+            let songs: Vec<String> = (offset..self.songs.min(offset + count))
                 .map(|i| {
                     format!(r#"{{"id":"s{i}","artist":"A","album":"B","title":"T{i}","genre":""}}"#)
                 })
@@ -121,12 +222,43 @@ mod tests {
         }
     }
 
+    fn print(server: &Server) -> String {
+        fingerprint(server, "me").unwrap()
+    }
+
     #[test]
-    fn the_fingerprint_is_the_count_and_the_last_scan() {
-        assert_eq!(
-            fingerprint(&Server(0), "me").unwrap(),
-            "7@2026-10-31T10:00:00Z"
-        );
+    fn a_scan_that_changes_nothing_keeps_the_fingerprint() {
+        // The server rescans whenever any watched folder changes, such as one that only holds playlists.
+        let later = Server {
+            last_scan: "2026-10-31T10:05:00Z",
+            ..Server(0)
+        };
+        assert_eq!(print(&Server(0)), print(&later));
+    }
+
+    #[test]
+    fn renaming_an_artist_changes_the_fingerprint() {
+        let renamed = Server {
+            artist: "Queen II",
+            ..Server(0)
+        };
+        assert_ne!(print(&Server(0)), print(&renamed));
+    }
+
+    #[test]
+    fn a_song_changing_genre_changes_the_fingerprint() {
+        let regenred = Server {
+            rock: 4,
+            ..Server(0)
+        };
+        assert_ne!(print(&Server(0)), print(&regenred));
+    }
+
+    #[test]
+    fn the_fingerprint_is_short_and_stable() {
+        let a = print(&Server(0));
+        assert_eq!(a, print(&Server(0)));
+        assert!(a.len() < 40, "{a}");
     }
 
     #[test]

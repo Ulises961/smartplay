@@ -14,6 +14,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
+
 use crate::normalize::{content_tokens, edit_distance, fold, split_credit, strip_remaster};
 
 /// Names must overlap at least this much, besides sharing an album or songs, to be merged.
@@ -32,14 +34,25 @@ pub struct Track {
     pub artist_mbid: Option<String>,
 }
 
-/// What the user decided about pairs of artist names. Decisions beat every other evidence.
-#[derive(Default)]
+/// What the user decided about pairs of artist names. Decisions beat every other evidence. Pairs are kept as folded names,
+/// so a decision holds whatever the case, accents or joiner of the spelling it was made with.
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decisions {
     same: BTreeSet<(String, String)>,
     different: BTreeSet<(String, String)>,
 }
 
 impl Decisions {
+    /// Pairs of folded names the user said are one artist.
+    pub fn same_pairs(&self) -> impl Iterator<Item = &(String, String)> {
+        self.same.iter()
+    }
+
+    /// Pairs of folded names the user said are two artists.
+    pub fn different_pairs(&self) -> impl Iterator<Item = &(String, String)> {
+        self.different.iter()
+    }
+
     pub fn same(&mut self, a: &str, b: &str) {
         self.same.insert(pair(a, b));
     }
@@ -426,6 +439,23 @@ pub fn resolve(tracks: &[Track], decisions: &Decisions) -> Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decisions_survive_a_round_trip_and_ignore_order_and_case() {
+        let mut decisions = Decisions::default();
+        decisions.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota");
+        decisions.different("Queen", "Queen Latifah");
+        let again: Decisions =
+            serde_json::from_str(&serde_json::to_string(&decisions).unwrap()).unwrap();
+        assert_eq!(again, decisions);
+
+        let mut reversed = Decisions::default();
+        reversed.same("PATRICIO REY Y SUS REDONDITOS DE RICOTA", "los redondos");
+        assert_eq!(
+            reversed.same_pairs().collect::<Vec<_>>(),
+            decisions.same_pairs().collect::<Vec<_>>()
+        );
+    }
 
     fn song(artist: &str, album: &str, title: &str) -> Track {
         Track {

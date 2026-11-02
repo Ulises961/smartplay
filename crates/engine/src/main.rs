@@ -2,7 +2,11 @@
 //! State is a JSON file so the `servers` commands (separate processes) and `serve` share it.
 
 use serde::{Deserialize, Serialize};
-use smartplay_core::{identity::Decisions, protocol::*, taste};
+use smartplay_core::{
+    identity::{self, Decisions},
+    protocol::*,
+    taste,
+};
 use std::{
     fs,
     io::{Read, Write},
@@ -92,9 +96,36 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes every library copy a server holds.
-    fn forget_libraries(&self, server: &str) {
-        let prefix = format!("library-{}-", hex(server));
+    fn decisions_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("decisions-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// What a user decided about artist names; nothing decided when there is no file or it cannot be read.
+    fn decisions(&self, server: &str, user: &str) -> Decisions {
+        fs::read_to_string(self.decisions_path(server, user))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Changes a user's decisions and keeps them.
+    fn remember(&self, server: &str, user: &str, change: impl FnOnce(&mut Decisions)) {
+        let mut decisions = self.decisions(server, user);
+        change(&mut decisions);
+        fs::write(
+            self.decisions_path(server, user),
+            serde_json::to_string_pretty(&decisions).unwrap(),
+        )
+        .expect("write decisions");
+    }
+
+    /// Deletes everything a server holds about its users: library copies and decisions.
+    fn forget_data(&self, server: &str) {
+        let prefixes = [
+            format!("library-{}-", hex(server)),
+            format!("decisions-{}-", hex(server)),
+        ];
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -102,7 +133,8 @@ impl Store {
             dir
         };
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if prefixes.iter().any(|p| name.starts_with(p)) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -163,8 +195,90 @@ fn main() {
             &arg("--bind").unwrap_or_else(|| "127.0.0.1:7788".into()),
         ),
         Some("servers") => servers_command(store, &args[1..]),
+        Some("artists") => artists_command(store, &args[1..]),
         _ => eprintln!(
-            "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME"
+            "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
+             smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER"
+        ),
+    }
+}
+
+/// The words of a command, without the `--flag VALUE` pairs the engine itself takes.
+fn positional(args: &[String]) -> Vec<&str> {
+    let mut words = vec![];
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+        } else if a == "--data" || a == "--bind" {
+            skip = true;
+        } else {
+            words.push(a.as_str());
+        }
+    }
+    words
+}
+
+/// Artist names the user says are one artist or two, and what the library still leaves open. Names are matched as
+/// folded text, so case, accents and `&`/`y`/`and` do not matter. Nothing in the library is renamed.
+fn artists_command(store: Store, args: &[String]) {
+    match positional(args).as_slice() {
+        [verb @ ("same" | "different"), server, user, a, b] => {
+            store.remember(server, user, |d| {
+                if *verb == "same" {
+                    d.same(a, b)
+                } else {
+                    d.different(a, b)
+                }
+            });
+            println!("kept: '{a}' and '{b}' are {verb} for {user} on {server}");
+        }
+        ["list", server, user] => {
+            let decisions = store.decisions(server, user);
+            for (a, b) in decisions.same_pairs() {
+                println!("same       {a}  =  {b}");
+            }
+            for (a, b) in decisions.different_pairs() {
+                println!("different  {a}  !=  {b}");
+            }
+            let Some(copy) = store.library(server, user) else {
+                println!("no library copy for {user} on {server} yet, so no suggestions");
+                return;
+            };
+            let tracks: Vec<identity::Track> = copy
+                .songs
+                .iter()
+                .map(|s| identity::Track {
+                    artist: s.artist.clone(),
+                    album: s.album.clone(),
+                    title: s.title.clone(),
+                    artist_mbid: s.artist_mbid.clone(),
+                })
+                .collect();
+            let found = identity::resolve(&tracks, &decisions);
+            for c in found.clusters.iter().filter(|c| c.spellings.len() > 1) {
+                println!(
+                    "one artist  {} songs  {}",
+                    c.tracks,
+                    c.spellings.join("  |  ")
+                );
+            }
+            for s in found.suggestions.iter().take(20) {
+                println!(
+                    "maybe       {:>3.0}%  '{}'  and  '{}'",
+                    s.score * 100.0,
+                    s.a,
+                    s.b
+                );
+            }
+            if !found.suggestions.is_empty() {
+                println!(
+                    "to decide: smartplay-engine artists same|different {server} {user} NAME NAME"
+                );
+            }
+        }
+        _ => eprintln!(
+            "usage: artists same|different SERVER USER NAME NAME | artists list SERVER USER"
         ),
     }
 }
@@ -188,9 +302,9 @@ fn servers_command(store: Store, args: &[String]) {
         (Some("remove"), Some(name)) => {
             servers.retain(|s| &s.name != name);
             store.save(&servers);
-            store.forget_libraries(name);
+            store.forget_data(name);
             println!(
-                "removed '{name}': its token no longer works and its library copies are deleted"
+                "removed '{name}': its token no longer works and its library copies and artist decisions are deleted"
             );
         }
         (Some("list"), _) => {
@@ -305,7 +419,7 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     songs: taste::more_of_what_you_star(
                         &copy.songs,
                         &req.starred,
-                        &Decisions::default(),
+                        &store.decisions(&server.name, &req.user),
                         PLAYLIST_SIZE,
                     ),
                 },
@@ -472,11 +586,69 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_server_deletes_its_library_copies() {
+    fn removing_a_server_deletes_its_library_copies_and_decisions() {
         let store = paired("remove");
         upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
+        store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
         assert!(store.library("home", "ana").is_some());
-        store.forget_libraries("home");
+        store.forget_data("home");
         assert!(store.library("home", "ana").is_none());
+        assert_eq!(store.decisions("home", "ana"), Decisions::default());
+    }
+
+    #[test]
+    fn a_decision_joins_two_spellings_in_the_playlist_of_that_user_only() {
+        let store = paired("decide");
+        upload(
+            &store,
+            "1@x",
+            &[vec![
+                song("a1", "Patricio Rey y sus Redonditos de Ricota"),
+                song("a2", "Los Redondos"),
+            ]],
+        );
+        let empty = ComputeResponse::Playlist {
+            playlist: "smartplay".into(),
+            songs: vec![],
+        };
+        assert_eq!(compute(&store, "1@x"), empty, "nothing joins them yet");
+
+        store.remember("home", "bea", |d| {
+            d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
+        });
+        assert_eq!(compute(&store, "1@x"), empty, "another user's decision");
+
+        store.remember("home", "ana", |d| {
+            d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
+        });
+        assert_eq!(
+            compute(&store, "1@x"),
+            ComputeResponse::Playlist {
+                playlist: "smartplay".into(),
+                songs: vec!["a2".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn the_data_flag_and_its_value_are_not_part_of_a_command() {
+        let args: Vec<String> = ["same", "home", "ana", "A", "B", "--data", "/d"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            positional(&args),
+            vec!["same", "home", "ana", "A", "B"],
+            "the value after --data is not a word of the command"
+        );
+    }
+
+    #[test]
+    fn decisions_are_kept_between_runs_and_added_to() {
+        let store = paired("keep");
+        store.remember("home", "ana", |d| d.same("A", "B"));
+        store.remember("home", "ana", |d| d.different("C", "D"));
+        let d = store.decisions("home", "ana");
+        assert_eq!(d.same_pairs().count(), 1);
+        assert_eq!(d.different_pairs().count(), 1);
     }
 }
