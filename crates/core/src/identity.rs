@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::normalize::{content_tokens, edit_distance, fold, strip_remaster};
+use crate::normalize::{content_tokens, edit_distance, fold, split_credit, strip_remaster};
 
 /// Names must overlap at least this much, besides sharing an album or songs, to be merged.
 const MERGE_LIKENESS: f64 = 0.6;
@@ -178,6 +178,51 @@ fn candidate_pairs(spellings: &[Spelling]) -> BTreeSet<(usize, usize)> {
     pairs
 }
 
+/// Whether a form of a name lists several artists: `Fito Paez/Joaquín Sabina`, `Dua Lipa, Angèle`, `A vs B`, `A feat. B`.
+/// A bare `&` is not enough: `Simon & Garfunkel` and `Bob Marley & The Wailers` are as often one act.
+fn lists_artists(form: &str) -> bool {
+    let lower = form.to_lowercase();
+    form.contains('/')
+        || form.contains(',')
+        || lower.contains(" vs ")
+        || lower.contains(" vs. ")
+        || !split_credit(form).guests.is_empty()
+}
+
+/// Which spellings are credits: they list artists, or they hold the whole names of two spellings that share no word, as
+/// `Fito Paez & Enanitos Verdes` does when both bands are in the library.
+fn credits(spellings: &[Spelling], pairs: &BTreeSet<(usize, usize)>) -> Vec<bool> {
+    let holds = |outer: usize, inner: usize| {
+        let (outer, inner) = (&spellings[outer].tokens, &spellings[inner].tokens);
+        !inner.is_empty()
+            && inner.len() < outer.len()
+            && inner.iter().all(|t| outer.iter().any(|w| same_word(t, w)))
+    };
+    let mut inside: Vec<Vec<usize>> = vec![vec![]; spellings.len()];
+    for &(a, b) in pairs {
+        if holds(a, b) {
+            inside[a].push(b);
+        } else if holds(b, a) {
+            inside[b].push(a);
+        }
+    }
+    let apart = |x: usize, y: usize| {
+        spellings[x]
+            .tokens
+            .iter()
+            .all(|t| !spellings[y].tokens.iter().any(|w| same_word(t, w)))
+    };
+    (0..spellings.len())
+        .map(|i| {
+            spellings[i].shown.keys().any(|form| lists_artists(form))
+                || inside[i]
+                    .iter()
+                    .enumerate()
+                    .any(|(n, &x)| inside[i][n + 1..].iter().any(|&y| apart(x, y)))
+        })
+        .collect()
+}
+
 /// Groups of spellings, merged one link at a time.
 struct Groups {
     owner: Vec<usize>,
@@ -287,7 +332,13 @@ pub fn resolve(tracks: &[Track], decisions: &Decisions) -> Resolution {
 
     // 3 and 4. Library evidence, and what is only worth a suggestion.
     let mut weak: Vec<(usize, usize, f64)> = vec![];
-    for (a, b) in candidate_pairs(&spellings) {
+    let pairs = candidate_pairs(&spellings);
+    let credits = credits(&spellings, &pairs);
+    for (a, b) in pairs {
+        // A credit names several artists. Matching it by name to one of them would join the others through it.
+        if credits[a] || credits[b] {
+            continue;
+        }
         let score = likeness(&spellings[a].tokens, &spellings[b].tokens);
         if score < SUGGEST_LIKENESS {
             continue;
@@ -389,6 +440,68 @@ mod tests {
         (1..=count)
             .map(|n| song(artist, album, &format!("{album} {n}")))
             .collect()
+    }
+
+    /// The cluster that holds `spelling`, as the spellings it joined.
+    fn joined_with<'a>(found: &'a Resolution, spelling: &str) -> &'a [String] {
+        &found
+            .clusters
+            .iter()
+            .find(|c| c.spellings.iter().any(|s| s == spelling))
+            .unwrap_or_else(|| panic!("no cluster holds {spelling}"))
+            .spellings
+    }
+
+    #[test]
+    fn a_credit_naming_two_artists_does_not_join_them() {
+        // `Fito Paez/Joaquin Sabina` holds both full names and shares an album with each, which used to join the two.
+        let mut t = songs("Fito Paez", "Enemigos Intimos", 2);
+        t.extend(songs("Fito Paez", "Circo Beat", 5));
+        t.extend(songs("Joaquin Sabina", "Enemigos Intimos", 2));
+        t.extend(songs("Joaquin Sabina", "19 Dias", 5));
+        t.extend(songs("Fito Paez/Joaquin Sabina", "Enemigos Intimos", 3));
+        let found = resolve(&t, &Decisions::default());
+        assert_eq!(joined_with(&found, "Fito Paez"), ["Fito Paez"]);
+        assert_eq!(joined_with(&found, "Joaquin Sabina"), ["Joaquin Sabina"]);
+    }
+
+    #[test]
+    fn a_credit_with_an_ampersand_naming_two_artists_does_not_join_them() {
+        let mut t = songs("Simon", "Hearts and Bones", 4);
+        t.extend(songs("Garfunkel", "Angel Clare", 4));
+        t.extend(songs("Simon & Garfunkel", "Hearts and Bones", 4));
+        t.extend(songs("Simon & Garfunkel", "Angel Clare", 4));
+        let found = resolve(&t, &Decisions::default());
+        assert_eq!(joined_with(&found, "Simon"), ["Simon"]);
+        assert_eq!(joined_with(&found, "Garfunkel"), ["Garfunkel"]);
+    }
+
+    #[test]
+    fn a_credit_with_a_guest_is_not_the_artist_even_when_the_guest_is_unknown() {
+        let mut t = songs("Dua Lipa", "Future Nostalgia", 6);
+        t.extend(songs("Dua Lipa, Angele", "Future Nostalgia", 2));
+        let found = resolve(&t, &Decisions::default());
+        assert_eq!(joined_with(&found, "Dua Lipa"), ["Dua Lipa"]);
+    }
+
+    #[test]
+    fn a_band_and_its_backing_group_still_join_when_the_group_is_no_artist_of_its_own() {
+        let mut t = songs("Bob Marley", "Exodus", 6);
+        t.extend(songs("Bob Marley & The Wailers", "Exodus", 3));
+        let found = resolve(&t, &Decisions::default());
+        assert_eq!(joined_with(&found, "Bob Marley").len(), 2);
+    }
+
+    #[test]
+    fn the_user_can_still_join_a_credit_to_its_lead() {
+        let mut t = songs("Fito Paez", "Circo Beat", 5);
+        t.extend(songs("Joaquin Sabina", "19 Dias", 5));
+        t.extend(songs("Fito Paez/Joaquin Sabina", "Enemigos Intimos", 3));
+        let mut decisions = Decisions::default();
+        decisions.same("Fito Paez/Joaquin Sabina", "Fito Paez");
+        let found = resolve(&t, &decisions);
+        assert_eq!(joined_with(&found, "Fito Paez").len(), 2);
+        assert_eq!(joined_with(&found, "Joaquin Sabina"), ["Joaquin Sabina"]);
     }
 
     /// One band under seven spellings, shaped like a real library: joiners and case differ, a short form shares
