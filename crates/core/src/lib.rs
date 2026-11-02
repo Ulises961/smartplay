@@ -3,9 +3,11 @@
 use serde::Deserialize;
 
 pub mod identity;
+pub mod library;
 pub mod normalize;
 pub mod playlist;
 pub mod protocol;
+pub mod taste;
 
 /// A way to call a Subsonic-compatible server. `request` is the endpoint with its query,
 /// e.g. `getStarred2?u=me`, and the answer is the raw JSON body.
