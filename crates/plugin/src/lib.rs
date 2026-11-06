@@ -8,6 +8,8 @@ nd_pdk::register_lifecycle_init!(Smartplay);
 nd_pdk::register_scheduler_callback!(Smartplay);
 
 const TOKEN_KEY: &str = "engine_token";
+/// Albums asked for to learn the artists played lately.
+const RECENT_ALBUMS: usize = 20;
 
 #[derive(Default)]
 struct Smartplay;
@@ -129,9 +131,15 @@ fn upload_library(base: &str, token: &str, user: &str, fingerprint: &str) -> Res
 
 fn run_user(base: &str, token: &str, user: &str) -> Result<String, String> {
     let fingerprint = library::fingerprint(&HostApi, user)?;
+    // The mixes are an extra: a server that cannot tell what was played lately still gets the main playlist.
+    let recent = library::recent_artists(&HostApi, user, RECENT_ALBUMS).unwrap_or_else(|e| {
+        warn!("smartplay: {user}: recent albums unavailable: {e}");
+        vec![]
+    });
     let request = ComputeRequest {
         user: user.into(),
         starred: smartplay_core::starred_ids(&HostApi, user)?,
+        recent,
         fingerprint: fingerprint.clone(),
     };
     let mut answer = ask(base, token, &request)?;
@@ -141,9 +149,25 @@ fn run_user(base: &str, token: &str, user: &str) -> Result<String, String> {
         answer = ask(base, token, &request)?;
     }
     match answer {
-        ComputeResponse::Playlist { playlist, songs } => {
-            let outcome = playlist::write_playlist(&HostApi, user, &playlist, &songs)?;
-            Ok(format!("{outcome:?}"))
+        ComputeResponse::Playlist {
+            playlist,
+            songs,
+            mixes,
+        } => {
+            let mut outcomes = vec![format!(
+                "{playlist}: {:?}",
+                playlist::write_playlist(&HostApi, user, &playlist, &songs)?
+            )];
+            for mix in mixes {
+                // One failing mix does not stop the others.
+                outcomes.push(
+                    match playlist::write_playlist(&HostApi, user, &mix.playlist, &mix.songs) {
+                        Ok(outcome) => format!("{}: {outcome:?}", mix.playlist),
+                        Err(e) => format!("{}: {e}", mix.playlist),
+                    },
+                );
+            }
+            Ok(outcomes.join(", "))
         }
         ComputeResponse::NeedLibrary => Err("the engine asks for the library again".into()),
     }
