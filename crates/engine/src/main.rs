@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
     mix,
+    plays::{self, Play},
     protocol::*,
     taste,
 };
@@ -22,6 +23,8 @@ const PLAYLIST_SIZE: usize = 50;
 /// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
 const MIX_PLAYLIST: &str = "smartplay: mix";
 const MIX_SIZE: usize = 50;
+/// Artists a mix starts from at most: the latest ones played, then the ones of the albums the server lists as recent.
+const RECENT_ARTISTS: usize = 20;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
 #[derive(Serialize, Deserialize)]
@@ -124,11 +127,38 @@ impl Store {
         .expect("write decisions");
     }
 
-    /// Deletes everything a server holds about its users: library copies and decisions.
+    fn plays_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("plays-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// The tail of plays kept for a user, oldest first; empty when there is no file or it cannot be read.
+    fn plays(&self, server: &str, user: &str) -> Vec<Play> {
+        fs::read_to_string(self.plays_path(server, user))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Adds a play to the user's tail. Returns whether it was new.
+    fn record_play(&self, server: &str, user: &str, play: Play) -> Result<bool, String> {
+        let mut log = self.plays(server, user);
+        if !plays::record(&mut log, play) {
+            return Ok(false);
+        }
+        let path = self.plays_path(server, user);
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_string(&log).unwrap()).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Deletes everything a server holds about its users: library copies, decisions and plays.
     fn forget_data(&self, server: &str) {
         let prefixes = [
             format!("library-{}-", hex(server)),
             format!("decisions-{}-", hex(server)),
+            format!("plays-{}-", hex(server)),
         ];
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
         let dir = if dir.as_os_str().is_empty() {
@@ -397,7 +427,7 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 serde_json::to_string(&EnrollResponse { token }).unwrap(),
             )
         }
-        "/compute" | "/library" => {
+        "/compute" | "/library" | "/play" => {
             let Some(server) = bearer.and_then(|token| {
                 servers
                     .iter()
@@ -414,14 +444,32 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     Err(e) => (500, e),
                 };
             }
+            if url == "/play" {
+                let Ok(report) = serde_json::from_str::<PlayReport>(body) else {
+                    return (400, "bad request".into());
+                };
+                return match store.record_play(&server.name, &report.user, report.play) {
+                    Ok(_) => (200, "ok".into()),
+                    Err(e) => (500, e),
+                };
+            }
             let Ok(req) = serde_json::from_str::<ComputeRequest>(body) else {
                 return (400, "bad request".into());
             };
             let answer = match store.library(&server.name, &req.user) {
                 Some(copy) if copy.fingerprint == req.fingerprint => {
                     let decisions = store.decisions(&server.name, &req.user);
+                    // What the engine saw played comes first, then the artists of the albums the server lists as
+                    // recent: they cover the time before the engine was told about plays. Naming an artist twice
+                    // changes nothing, the mix tells artists apart by identity.
+                    let mut recent = plays::recent_artists(
+                        &store.plays(&server.name, &req.user),
+                        RECENT_ARTISTS,
+                    );
+                    recent.extend(req.recent.iter().cloned());
+                    recent.truncate(RECENT_ARTISTS);
                     let mixes =
-                        mix::recent_artist_mixes(&copy.songs, &req.recent, &decisions, MIX_SIZE)
+                        mix::recent_artist_mixes(&copy.songs, &recent, &decisions, MIX_SIZE)
                             .into_iter()
                             .enumerate()
                             .map(|(i, songs)| Mix {
@@ -565,6 +613,77 @@ mod tests {
         );
     }
 
+    fn report_play(store: &Store, user: &str, song: &str, artist: &str, at: i64) -> u16 {
+        let body = serde_json::to_string(&PlayReport {
+            user: user.into(),
+            play: Play {
+                song: song.into(),
+                artists: vec![artist.into()],
+                at,
+            },
+        })
+        .unwrap();
+        call(store, "/play", body, Some("tok")).0
+    }
+
+    fn mix_songs(answer: ComputeResponse) -> Vec<Vec<String>> {
+        let ComputeResponse::Playlist { mixes, .. } = answer else {
+            panic!("the library is there");
+        };
+        mixes.into_iter().map(|m| m.songs).collect()
+    }
+
+    #[test]
+    fn plays_the_engine_was_told_about_seed_the_mixes() {
+        let store = paired("plays");
+        upload(
+            &store,
+            "1@x",
+            &[vec![
+                song("a1", "Queen"),
+                song("p1", "Portishead"),
+                song("p2", "Portishead"),
+            ]],
+        );
+        assert!(mix_songs(compute(&store, "1@x")).is_empty());
+        assert_eq!(report_play(&store, "ana", "p1", "Portishead", 100), 200);
+        assert_eq!(
+            mix_songs(compute(&store, "1@x")),
+            vec![vec!["p1".to_string(), "p2".to_string()]]
+        );
+    }
+
+    #[test]
+    fn plays_come_before_the_recent_albums_the_server_lists() {
+        let store = paired("order");
+        upload(
+            &store,
+            "1@x",
+            &[vec![song("a1", "Queen"), song("p1", "Portishead")]],
+        );
+        report_play(&store, "ana", "p1", "Portishead", 100);
+        // The album listing names Queen; the play says Portishead, which is the more recent artist.
+        let mixes = mix_songs(compute_recent(&store, "1@x", &["Queen"]));
+        assert_eq!(mixes, vec![vec!["p1".to_string(), "a1".to_string()]]);
+    }
+
+    #[test]
+    fn plays_are_kept_per_user_and_a_repeated_report_counts_once() {
+        let store = paired("plays-users");
+        report_play(&store, "ana", "p1", "Portishead", 100);
+        report_play(&store, "ana", "p1", "Portishead", 100);
+        report_play(&store, "bea", "a1", "Queen", 100);
+        assert_eq!(store.plays("home", "ana").len(), 1);
+        assert_eq!(store.plays("home", "bea")[0].song, "a1");
+        assert!(store.plays("home", "cris").is_empty());
+    }
+
+    #[test]
+    fn a_play_report_that_is_not_one_is_refused() {
+        let store = paired("bad-play");
+        assert_eq!(call(&store, "/play", "{}".into(), Some("tok")).0, 400);
+    }
+
     #[test]
     fn a_new_fingerprint_asks_again_and_a_new_upload_replaces_the_copy() {
         let store = paired("stale");
@@ -629,7 +748,7 @@ mod tests {
     #[test]
     fn requests_without_a_known_token_are_refused() {
         let store = paired("auth");
-        for url in ["/compute", "/library"] {
+        for url in ["/compute", "/library", "/play"] {
             assert_eq!(call(&store, url, "{}".into(), None).0, 401);
             assert_eq!(call(&store, url, "{}".into(), Some("nope")).0, 401);
         }
@@ -640,9 +759,12 @@ mod tests {
         let store = paired("remove");
         upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
         store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
+        report_play(&store, "ana", "a1", "Queen", 100);
         assert!(store.library("home", "ana").is_some());
+        assert_eq!(store.plays("home", "ana").len(), 1);
         store.forget_data("home");
         assert!(store.library("home", "ana").is_none());
+        assert!(store.plays("home", "ana").is_empty());
         assert_eq!(store.decisions("home", "ana"), Decisions::default());
     }
 
