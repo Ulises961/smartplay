@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::{encode, taste::Song, Subsonic};
+use crate::{encode, normalize::fold, taste::Song, Subsonic};
 
 /// Songs asked for in one request.
 pub const PAGE: usize = 500;
@@ -24,6 +24,20 @@ struct Body {
     genres: Option<Genres>,
     #[serde(default, rename = "searchResult3")]
     search: Option<Search>,
+    #[serde(default, rename = "albumList2")]
+    albums: Option<Albums>,
+}
+
+#[derive(Deserialize, Default)]
+struct Albums {
+    #[serde(default)]
+    album: Vec<AlbumRaw>,
+}
+
+#[derive(Deserialize)]
+struct AlbumRaw {
+    #[serde(default)]
+    artist: String,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +123,25 @@ fn body(api: &dyn Subsonic, request: &str) -> Result<Body, String> {
         return Err(format!("server status {}", envelope.response.status));
     }
     Ok(envelope.response)
+}
+
+/// The artists of the albums the user played last, most recent first, each once. The server lists albums, not songs, so
+/// this is as close to "what they listened to lately" as the API goes. Compilations credited to "Various Artists" name
+/// no artist worth seeding a mix with and are left out.
+pub fn recent_artists(
+    api: &dyn Subsonic,
+    user: &str,
+    albums: usize,
+) -> Result<Vec<String>, String> {
+    let request = format!("getAlbumList2?u={}&type=recent&size={albums}", encode(user));
+    let found = body(api, &request)?.albums.unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    Ok(found
+        .album
+        .into_iter()
+        .map(|a| a.artist.trim().to_string())
+        .filter(|a| !a.is_empty() && fold(a) != "various artists" && seen.insert(fold(a)))
+        .collect())
 }
 
 /// Changes when what taste reads changes, and only then: the song count, each artist with its album count and each genre
@@ -306,6 +339,35 @@ mod tests {
         assert_eq!(found[0].genres, vec!["Rock", "Indie"]);
         assert_eq!(found[0].moods, vec!["Calm"]);
         assert!(found[1].genres.is_empty() && found[1].moods.is_empty());
+    }
+
+    struct Recent(&'static str);
+    impl Subsonic for Recent {
+        fn call(&self, request: &str) -> Result<String, String> {
+            assert!(request.starts_with("getAlbumList2?u=me&type=recent&size=5"));
+            Ok(format!(
+                r#"{{"subsonic-response":{{"status":"ok","albumList2":{}}}}}"#,
+                self.0
+            ))
+        }
+    }
+
+    #[test]
+    fn recent_artists_come_most_recent_first_once_each() {
+        let server = Recent(
+            r#"{"album":[{"artist":"Band B"},{"artist":"Various Artists"},{"artist":"Band A"},
+                {"artist":"band  b"},{"artist":""}]}"#,
+        );
+        assert_eq!(
+            recent_artists(&server, "me", 5).unwrap(),
+            vec!["Band B", "Band A"]
+        );
+    }
+
+    #[test]
+    fn a_user_who_played_nothing_has_no_recent_artists() {
+        // The server answers an empty object, not an empty list.
+        assert!(recent_artists(&Recent("{}"), "me", 5).unwrap().is_empty());
     }
 
     #[test]
