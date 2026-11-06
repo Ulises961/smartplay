@@ -7,6 +7,7 @@ pub mod library;
 pub mod mix;
 pub mod normalize;
 pub mod playlist;
+pub mod plays;
 pub mod protocol;
 pub mod taste;
 

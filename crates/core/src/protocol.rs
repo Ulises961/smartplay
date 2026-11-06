@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::plays::Play;
 use crate::taste::Song;
 
 #[derive(Serialize, Deserialize)]
@@ -39,6 +40,13 @@ pub enum ComputeResponse {
     },
     /// The engine holds no copy of the library, or an older one: upload it as `LibraryChunk`s, then ask again.
     NeedLibrary,
+}
+
+/// Tells the engine a user finished playing a song.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct PlayReport {
+    pub user: String,
+    pub play: Play,
 }
 
 /// A playlist the engine asks the connector to write.
