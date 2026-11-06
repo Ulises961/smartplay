@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
+    mix,
     protocol::*,
     taste,
 };
@@ -18,6 +19,9 @@ const CODE_LIFETIME_SECS: u64 = 15 * 60;
 /// The playlist every granted user gets, and how many songs it holds.
 const PLAYLIST: &str = "smartplay";
 const PLAYLIST_SIZE: usize = 50;
+/// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
+const MIX_PLAYLIST: &str = "smartplay: mix";
+const MIX_SIZE: usize = 50;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
 #[derive(Serialize, Deserialize)]
@@ -414,15 +418,28 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 return (400, "bad request".into());
             };
             let answer = match store.library(&server.name, &req.user) {
-                Some(copy) if copy.fingerprint == req.fingerprint => ComputeResponse::Playlist {
-                    playlist: PLAYLIST.into(),
-                    songs: taste::more_of_what_you_star(
-                        &copy.songs,
-                        &req.starred,
-                        &store.decisions(&server.name, &req.user),
-                        PLAYLIST_SIZE,
-                    ),
-                },
+                Some(copy) if copy.fingerprint == req.fingerprint => {
+                    let decisions = store.decisions(&server.name, &req.user);
+                    let mixes =
+                        mix::recent_artist_mixes(&copy.songs, &req.recent, &decisions, MIX_SIZE)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, songs)| Mix {
+                                playlist: format!("{MIX_PLAYLIST} {}", i + 1),
+                                songs,
+                            })
+                            .collect();
+                    ComputeResponse::Playlist {
+                        playlist: PLAYLIST.into(),
+                        songs: taste::more_of_what_you_star(
+                            &copy.songs,
+                            &req.starred,
+                            &decisions,
+                            PLAYLIST_SIZE,
+                        ),
+                        mixes,
+                    }
+                }
                 _ => ComputeResponse::NeedLibrary,
             };
             (200, serde_json::to_string(&answer).unwrap())
@@ -456,8 +473,7 @@ mod tests {
             artist: artist.into(),
             album: "Album".into(),
             title: format!("Title {id}"),
-            genre: None,
-            artist_mbid: None,
+            ..Default::default()
         }
     }
 
@@ -466,9 +482,14 @@ mod tests {
     }
 
     fn compute(store: &Store, fingerprint: &str) -> ComputeResponse {
+        compute_recent(store, fingerprint, &[])
+    }
+
+    fn compute_recent(store: &Store, fingerprint: &str, recent: &[&str]) -> ComputeResponse {
         let body = serde_json::to_string(&ComputeRequest {
             user: "ana".into(),
             starred: vec!["a1".into()],
+            recent: recent.iter().map(|a| a.to_string()).collect(),
             fingerprint: fingerprint.into(),
         })
         .unwrap();
@@ -513,7 +534,34 @@ mod tests {
             ComputeResponse::Playlist {
                 playlist: "smartplay".into(),
                 songs: vec!["a2".into(), "a3".into()],
+                mixes: vec![],
             }
+        );
+    }
+
+    #[test]
+    fn the_artists_played_lately_get_mixes_beside_the_playlist() {
+        let store = paired("mixes");
+        upload(
+            &store,
+            "1@x",
+            &[vec![
+                song("a1", "Queen"),
+                song("a2", "Queen"),
+                song("p1", "Portishead"),
+            ]],
+        );
+        let ComputeResponse::Playlist { mixes, .. } =
+            compute_recent(&store, "1@x", &["Portishead", "Nobody"])
+        else {
+            panic!("the library is there");
+        };
+        assert_eq!(
+            mixes,
+            vec![Mix {
+                playlist: "smartplay: mix 1".into(),
+                songs: vec!["p1".into()],
+            }]
         );
     }
 
@@ -536,6 +584,7 @@ mod tests {
             ComputeResponse::Playlist {
                 playlist: "smartplay".into(),
                 songs: vec!["a9".into()],
+                mixes: vec![],
             }
         );
     }
@@ -566,6 +615,7 @@ mod tests {
         let body = serde_json::to_string(&ComputeRequest {
             user: "bob".into(),
             starred: vec![],
+            recent: vec![],
             fingerprint: "1@x".into(),
         })
         .unwrap();
@@ -610,6 +660,7 @@ mod tests {
         let empty = ComputeResponse::Playlist {
             playlist: "smartplay".into(),
             songs: vec![],
+            mixes: vec![],
         };
         assert_eq!(compute(&store, "1@x"), empty, "nothing joins them yet");
 
@@ -626,6 +677,7 @@ mod tests {
             ComputeResponse::Playlist {
                 playlist: "smartplay".into(),
                 songs: vec!["a2".into()],
+                mixes: vec![],
             }
         );
     }
