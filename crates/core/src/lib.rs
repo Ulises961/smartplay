@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 pub mod identity;
 pub mod library;
+pub mod mix;
 pub mod normalize;
 pub mod playlist;
 pub mod protocol;
