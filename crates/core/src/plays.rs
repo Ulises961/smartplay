@@ -23,6 +23,27 @@ pub struct Play {
     pub at: i64,
 }
 
+impl Play {
+    /// A play of `song`. `credited` are the artists the server lists for the song; when it lists none, the artist as
+    /// the server displays it stands in.
+    pub fn new(song: &str, credited: &[String], displayed: &str, at: i64) -> Play {
+        let mut artists: Vec<String> = credited
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(String::from)
+            .collect();
+        if artists.is_empty() && !displayed.trim().is_empty() {
+            artists.push(displayed.trim().into());
+        }
+        Play {
+            song: song.into(),
+            artists,
+            at,
+        }
+    }
+}
+
 /// Adds `play` to `log`, keeping it in time order and at most [`KEEP`] long. Returns `false`, changing nothing, when
 /// the same song at the same time is already there: a server that could not be sure the engine heard a play sends it again.
 pub fn record(log: &mut Vec<Play>, play: Play) -> bool {
@@ -60,6 +81,17 @@ mod tests {
             artists: vec![artist.into()],
             at,
         }
+    }
+
+    #[test]
+    fn the_displayed_artist_stands_in_when_the_server_lists_none() {
+        let listed = ["Lead".to_string(), " ".to_string()];
+        assert_eq!(Play::new("s", &listed, "Lead feat. X", 1).artists, ["Lead"]);
+        assert_eq!(
+            Play::new("s", &[], " Lead feat. X ", 1).artists,
+            ["Lead feat. X"]
+        );
+        assert!(Play::new("s", &[], "", 1).artists.is_empty());
     }
 
     #[test]

@@ -2,10 +2,15 @@ use extism_pdk::*;
 use nd_pdk::host::{http, kvstore, scheduler, subsonicapi, users};
 use nd_pdk::lifecycle::{Error as LifecycleError, InitProvider};
 use nd_pdk::scheduler::{CallbackProvider, Error as SchedulerError, SchedulerCallbackRequest};
-use smartplay_core::{library, playlist, protocol::*, Subsonic};
+use nd_pdk::scrobbler::{
+    Error as ScrobbleError, IsAuthorizedRequest, NowPlayingRequest, PlaybackReportRequest,
+    ScrobbleRequest, Scrobbler, SCROBBLER_ERROR_RETRY_LATER,
+};
+use smartplay_core::{library, playlist, plays::Play, protocol::*, Subsonic};
 
 nd_pdk::register_lifecycle_init!(Smartplay);
 nd_pdk::register_scheduler_callback!(Smartplay);
+nd_pdk::register_scrobbler!(Smartplay);
 
 const TOKEN_KEY: &str = "engine_token";
 /// Albums asked for to learn the artists played lately.
@@ -173,13 +178,71 @@ fn run_user(base: &str, token: &str, user: &str) -> Result<String, String> {
     }
 }
 
+/// The engine address from the plugin settings, when one is set.
+fn engine_url() -> Option<String> {
+    config::get("engine_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+}
+
+/// The token kept after enrolling, without trying to enroll: the scrobbler calls must not depend on the engine being up.
+fn stored_token() -> Option<String> {
+    let bytes = kvstore::get(TOKEN_KEY).ok().flatten()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The scrobbler capability tells the engine about each finished play, so the mixes follow what is played right now.
+/// Only the finished play matters: a song that is playing, paused or skipped says little about taste.
+impl Scrobbler for Smartplay {
+    /// The server only sends plays of users the admin granted, and only once the plugin is enrolled.
+    fn is_authorized(&self, req: IsAuthorizedRequest) -> Result<bool, ScrobbleError> {
+        let granted = match users::get_users() {
+            Ok(users) => users.iter().any(|u| u.user_name == req.username),
+            Err(e) => {
+                warn!("smartplay: cannot list the granted users: {e}");
+                false
+            }
+        };
+        Ok(granted && stored_token().is_some())
+    }
+
+    fn now_playing(&self, _req: NowPlayingRequest) -> Result<(), ScrobbleError> {
+        Ok(())
+    }
+
+    fn playback_report(&self, _req: PlaybackReportRequest) -> Result<(), ScrobbleError> {
+        Ok(())
+    }
+
+    /// An engine that cannot be reached now is "retry later": the server keeps the play and sends it again, and the engine
+    /// counts a play it receives twice once.
+    fn scrobble(&self, req: ScrobbleRequest) -> Result<(), ScrobbleError> {
+        let (Some(base), Some(token)) = (engine_url(), stored_token()) else {
+            return Err(ScrobbleError::new(SCROBBLER_ERROR_RETRY_LATER));
+        };
+        let credited: Vec<String> = req.track.artists.iter().map(|a| a.name.clone()).collect();
+        let report = PlayReport {
+            user: req.username.clone(),
+            play: Play::new(&req.track.id, &credited, &req.track.artist, req.timestamp),
+        };
+        engine_post(
+            &base,
+            "/play",
+            &token,
+            &serde_json::to_string(&report).unwrap(),
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            warn!("smartplay: {}: play not delivered: {e}", req.username);
+            ScrobbleError::new(SCROBBLER_ERROR_RETRY_LATER)
+        })
+    }
+}
+
 impl CallbackProvider for Smartplay {
     fn on_callback(&self, _req: SchedulerCallbackRequest) -> Result<(), SchedulerError> {
-        let Some(base) = config::get("engine_url")
-            .ok()
-            .flatten()
-            .filter(|u| !u.is_empty())
-        else {
+        let Some(base) = engine_url() else {
             warn!("smartplay: engine_url is not set");
             return Ok(());
         };
