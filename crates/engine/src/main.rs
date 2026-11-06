@@ -456,8 +456,7 @@ mod tests {
             artist: artist.into(),
             album: "Album".into(),
             title: format!("Title {id}"),
-            genre: None,
-            artist_mbid: None,
+            ..Default::default()
         }
     }
 

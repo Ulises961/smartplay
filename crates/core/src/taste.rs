@@ -11,16 +11,23 @@ use crate::identity::{resolve, Decisions, Track};
 use crate::normalize::fold;
 
 /// One song of the library.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Song {
     pub id: String,
     pub artist: String,
     pub album: String,
     pub title: String,
+    /// The first genre, as older copies of a library hold it.
     #[serde(default)]
     pub genre: Option<String>,
     #[serde(default)]
     pub artist_mbid: Option<String>,
+    /// Every genre tag of the song (the server splits `Rock;Indie` in two). Empty in copies uploaded before it was read.
+    #[serde(default)]
+    pub genres: Vec<String>,
+    /// Mood tags of the song. Empty when the files carry none.
+    #[serde(default)]
+    pub moods: Vec<String>,
 }
 
 /// An artist weighs twice a genre: a star says more about who made the song than about its label.
@@ -132,7 +139,7 @@ mod tests {
             album: album.into(),
             title: format!("Song {id}"),
             genre: (!genre.is_empty()).then(|| genre.into()),
-            artist_mbid: None,
+            ..Default::default()
         }
     }
 

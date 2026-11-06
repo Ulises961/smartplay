@@ -84,6 +84,21 @@ struct Raw {
     title: String,
     #[serde(default)]
     genre: Option<String>,
+    #[serde(default)]
+    genres: Vec<GenreName>,
+    #[serde(default)]
+    moods: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GenreName {
+    #[serde(default)]
+    name: String,
+}
+
+/// Tags with no text are no tags.
+fn non_empty(tags: impl IntoIterator<Item = String>) -> Vec<String> {
+    tags.into_iter().filter(|t| !t.trim().is_empty()).collect()
 }
 
 fn body(api: &dyn Subsonic, request: &str) -> Result<Body, String> {
@@ -155,6 +170,8 @@ pub fn songs(api: &dyn Subsonic, user: &str, offset: usize) -> Result<Vec<Song>,
             title: s.title,
             genre: s.genre.filter(|g| !g.is_empty()),
             artist_mbid: None,
+            genres: non_empty(s.genres.into_iter().map(|g| g.name)),
+            moods: non_empty(s.moods),
         })
         .collect())
 }
@@ -269,6 +286,26 @@ mod tests {
         assert_eq!((first.len(), second.len()), (PAGE, 3));
         assert_eq!(second[0].id, format!("s{PAGE}"));
         assert_eq!(first[0].genre, None, "an empty genre is no genre");
+    }
+
+    #[test]
+    fn every_genre_and_mood_of_a_song_is_read() {
+        struct Tagged;
+        impl Subsonic for Tagged {
+            fn call(&self, _: &str) -> Result<String, String> {
+                Ok(
+                    r#"{"subsonic-response":{"status":"ok","searchResult3":{"song":[
+                    {"id":"a","artist":"A","album":"B","title":"T","genre":"Rock",
+                     "genres":[{"name":"Rock"},{"name":"Indie"},{"name":" "}],"moods":["Calm",""]},
+                    {"id":"b","artist":"A","album":"B","title":"U"}]}}}"#
+                        .into(),
+                )
+            }
+        }
+        let found = songs(&Tagged, "me", 0).unwrap();
+        assert_eq!(found[0].genres, vec!["Rock", "Indie"]);
+        assert_eq!(found[0].moods, vec!["Calm"]);
+        assert!(found[1].genres.is_empty() && found[1].moods.is_empty());
     }
 
     #[test]
