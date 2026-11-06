@@ -86,6 +86,12 @@ the engine, the plugin drops its token and logs `engine rejected the token`; ent
 Star songs in any Subsonic client. Within a minute each granted user finds a playlist named `smartplay`. Grant or
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
+Play some albums and each user also finds up to two playlists, `smartplay: mix 1` and `smartplay: mix 2`, built from the
+artists of the albums they played last: about 60% songs of those artists and 40% songs of other artists whose genres and
+moods are close to them. When the songs carry tags, the artists are split between the two mixes by how alike they are.
+Nothing is kept between runs, so the mixes follow what was played the last time the plugin ran, and they work for a user
+who has starred nothing. They are ordinary playlists too.
+
 `smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
 example to keep only unplayed songs, or songs of one genre, in random order:
 
