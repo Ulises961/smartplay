@@ -43,7 +43,7 @@ internet; if the engine runs on another host than Navidrome, put it behind HTTPS
 ```bash
 ./target/release/smartplay-engine servers list              # paired or waiting for enrollment
 ./target/release/smartplay-engine servers add NAME          # another server entry, with a fresh code
-./target/release/smartplay-engine servers remove NAME       # revokes its token at once; deletes its library copies and decisions
+./target/release/smartplay-engine servers remove NAME       # revokes its token at once; deletes its library copies, decisions and plays
 ```
 
 A library often names one artist several ways (`Los Redondos`, `Patricio Rey y sus Redonditos de Ricota`). The engine
@@ -86,11 +86,16 @@ the engine, the plugin drops its token and logs `engine rejected the token`; ent
 Star songs in any Subsonic client. Within a minute each granted user finds a playlist named `smartplay`. Grant or
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
-Play some albums and each user also finds up to two playlists, `smartplay: mix 1` and `smartplay: mix 2`, built from the
-artists of the albums they played last: about 60% songs of those artists and 40% songs of other artists whose genres and
-moods are close to them. When the songs carry tags, the artists are split between the two mixes by how alike they are.
-Nothing is kept between runs, so the mixes follow what was played the last time the plugin ran, and they work for a user
-who has starred nothing. They are ordinary playlists too.
+Play some songs and each user also finds up to two playlists, `smartplay: mix 1` and `smartplay: mix 2`, built from the
+artists they played last: about 60% songs of those artists and 40% songs of other artists whose genres and moods are
+close to them. When the songs carry tags, the artists are split between the two mixes by how alike they are. They work
+for a user who has starred nothing, and they are ordinary playlists too.
+
+The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what was played
+a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps only the latest 500 plays of each user, with the song, its artists and the time: enough to
+know what was played lately, not a history of listening. If the engine cannot be reached, Navidrome holds the play and
+sends it again. Before the engine has heard of any play, and for what was played before the plugin was installed, the
+mixes start from the artists of the albums the server lists as recently played.
 
 `smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
 example to keep only unplayed songs, or songs of one genre, in random order:
@@ -111,7 +116,8 @@ example to keep only unplayed songs, or songs of one genre, in random order:
 ## Privacy
 
 Self-hosted software: the authors run no service, receive no data and include no telemetry. Everything stored stays on
-the machine where you run it. You, as the operator, are responsible for how you use this software, including informing
+the machine where you run it, in the engine's data folder: each granted user's library, their decisions about artist
+names, and the latest 500 plays (song, artists, time). Removing a server on the engine deletes all of it. You, as the operator, are responsible for how you use this software, including informing
 the users of your server.
 
 ## Contributing

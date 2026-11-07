@@ -2,7 +2,7 @@
   "name": "smartplay",
   "author": "Ulises961",
   "version": "0.0.1",
-  "description": "Connects Navidrome to the smartplay engine, which writes a playlist for each user you grant",
+  "description": "Connects Navidrome to the smartplay engine, which writes playlists for each user you grant from what they star and play",
   "config": {
     "schema": {
       "type": "object",
