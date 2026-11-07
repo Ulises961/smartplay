@@ -4,7 +4,8 @@ use nd_pdk::lifecycle::{Error as LifecycleError, InitProvider};
 use nd_pdk::scheduler::{CallbackProvider, Error as SchedulerError, SchedulerCallbackRequest};
 use nd_pdk::scrobbler::{
     Error as ScrobbleError, IsAuthorizedRequest, NowPlayingRequest, PlaybackReportRequest,
-    ScrobbleRequest, Scrobbler, SCROBBLER_ERROR_RETRY_LATER,
+    ScrobbleRequest, Scrobbler, SCROBBLER_ERROR_NOT_AUTHORIZED, SCROBBLER_ERROR_RETRY_LATER,
+    SCROBBLER_ERROR_UNRECOVERABLE,
 };
 use smartplay_core::{library, playlist, plays::Play, protocol::*, Subsonic};
 
@@ -63,8 +64,8 @@ fn post(base: &str, path: &str, token: Option<&str>, body: &str) -> Result<(i32,
 
 /// The stored token, or a new one from the one-time enrollment code in the settings.
 fn engine_token(base: &str) -> Result<Option<String>, String> {
-    if let Some(bytes) = kvstore::get(TOKEN_KEY).map_err(|e| e.to_string())? {
-        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+    if let Some(token) = stored_token()? {
+        return Ok(Some(token));
     }
     let Some(code) = config::get("enrollment_code")
         .ok()
@@ -87,15 +88,43 @@ fn engine_token(base: &str) -> Result<Option<String>, String> {
 }
 
 /// POSTs to the engine with the token and returns the body of a 200 answer.
-fn engine_post(base: &str, path: &str, token: &str, body: &str) -> Result<String, String> {
-    let (status, reply) = post(base, path, Some(token), body)?;
+fn engine_post(base: &str, path: &str, token: &str, body: &str) -> Result<String, EngineError> {
+    let (status, reply) = post(base, path, Some(token), body).map_err(EngineError::Unreachable)?;
     match status {
         200 => Ok(reply),
         401 => {
             let _ = kvstore::delete(TOKEN_KEY); // revoked on the engine: ask for a new code
-            Err("engine rejected the token; enroll again with a new code".into())
+            Err(EngineError::Rejected)
         }
-        _ => Err(format!("engine answered {status}")),
+        _ => Err(EngineError::Refused(status)),
+    }
+}
+
+/// Why a call to the engine failed. The scrobbler tells the server which failures are worth retrying.
+enum EngineError {
+    /// No answer: the engine is down or the network failed.
+    Unreachable(String),
+    /// The token was revoked on the engine; it has been dropped.
+    Rejected,
+    /// The engine answered with this status.
+    Refused(i32),
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineError::Unreachable(e) => write!(f, "{e}"),
+            EngineError::Rejected => {
+                write!(f, "engine rejected the token; enroll again with a new code")
+            }
+            EngineError::Refused(status) => write!(f, "engine answered {status}"),
+        }
+    }
+}
+
+impl From<EngineError> for String {
+    fn from(e: EngineError) -> String {
+        e.to_string()
     }
 }
 
@@ -187,9 +216,9 @@ fn engine_url() -> Option<String> {
 }
 
 /// The token kept after enrolling, without trying to enroll: the scrobbler calls must not depend on the engine being up.
-fn stored_token() -> Option<String> {
-    let bytes = kvstore::get(TOKEN_KEY).ok().flatten()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+fn stored_token() -> Result<Option<String>, String> {
+    let bytes = kvstore::get(TOKEN_KEY).map_err(|e| e.to_string())?;
+    Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
 /// The scrobbler capability tells the engine about each finished play, so the mixes follow what is played right now.
@@ -204,7 +233,13 @@ impl Scrobbler for Smartplay {
                 false
             }
         };
-        Ok(granted && stored_token().is_some())
+        // Without a token there is nowhere to send a play yet: the plugin enrolls on its next tick, and the albums the
+        // server lists as recent cover the plays of that gap.
+        let enrolled = stored_token().unwrap_or_else(|e| {
+            warn!("smartplay: cannot read the engine token: {e}");
+            None
+        });
+        Ok(granted && enrolled.is_some())
     }
 
     fn now_playing(&self, _req: NowPlayingRequest) -> Result<(), ScrobbleError> {
@@ -215,11 +250,17 @@ impl Scrobbler for Smartplay {
         Ok(())
     }
 
-    /// An engine that cannot be reached now is "retry later": the server keeps the play and sends it again, and the engine
-    /// counts a play it receives twice once.
+    /// An engine that cannot be reached now, or that failed, is "retry later": the server keeps the play and sends it
+    /// again, and the engine counts a play it receives twice once. A report the engine refuses will never be accepted,
+    /// and a revoked token needs a new enrollment: the server is told so and does not keep retrying.
     fn scrobble(&self, req: ScrobbleRequest) -> Result<(), ScrobbleError> {
-        let (Some(base), Some(token)) = (engine_url(), stored_token()) else {
-            return Err(ScrobbleError::new(SCROBBLER_ERROR_RETRY_LATER));
+        let retry_later = || ScrobbleError::new(SCROBBLER_ERROR_RETRY_LATER);
+        let token = stored_token().map_err(|e| {
+            warn!("smartplay: cannot read the engine token: {e}");
+            retry_later()
+        })?;
+        let (Some(base), Some(token)) = (engine_url(), token) else {
+            return Err(retry_later());
         };
         let credited: Vec<String> = req.track.artists.iter().map(|a| a.name.clone()).collect();
         let report = PlayReport {
@@ -235,7 +276,13 @@ impl Scrobbler for Smartplay {
         .map(|_| ())
         .map_err(|e| {
             warn!("smartplay: {}: play not delivered: {e}", req.username);
-            ScrobbleError::new(SCROBBLER_ERROR_RETRY_LATER)
+            match e {
+                EngineError::Rejected => ScrobbleError::new(SCROBBLER_ERROR_NOT_AUTHORIZED),
+                EngineError::Refused(status) if (400..500).contains(&status) => {
+                    ScrobbleError::new(SCROBBLER_ERROR_UNRECOVERABLE)
+                }
+                _ => retry_later(),
+            }
         })
     }
 }
