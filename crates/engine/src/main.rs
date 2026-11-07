@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
     mix,
+    normalize::fold,
     plays::{self, Play},
     protocol::*,
     taste,
 };
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Write},
     path::PathBuf,
@@ -142,11 +144,25 @@ impl Store {
 
     /// Adds a play to the user's tail. Returns whether it was new.
     fn record_play(&self, server: &str, user: &str, play: Play) -> Result<bool, String> {
-        let mut log = self.plays(server, user);
+        let path = self.plays_path(server, user);
+        let mut log = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                // Never write over a tail that cannot be read: keep it for the operator and start a new one.
+                let aside = path.with_extension("bad");
+                eprintln!(
+                    "{}: unreadable ({e}); kept as {}",
+                    path.display(),
+                    aside.display()
+                );
+                let _ = fs::rename(&path, aside);
+                vec![]
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e.to_string()),
+        };
         if !plays::record(&mut log, play) {
             return Ok(false);
         }
-        let path = self.plays_path(server, user);
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, serde_json::to_string(&log).unwrap()).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
@@ -448,6 +464,14 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 let Ok(report) = serde_json::from_str::<PlayReport>(body) else {
                     return (400, "bad request".into());
                 };
+                // A play that names no song or no artist seeds nothing and would only take one of the kept places.
+                let play = &report.play;
+                if report.user.trim().is_empty()
+                    || play.song.trim().is_empty()
+                    || play.artists.iter().all(|a| a.trim().is_empty())
+                {
+                    return (400, "a play needs a user, a song and an artist".into());
+                }
                 return match store.record_play(&server.name, &report.user, report.play) {
                     Ok(_) => (200, "ok".into()),
                     Err(e) => (500, e),
@@ -460,14 +484,18 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 Some(copy) if copy.fingerprint == req.fingerprint => {
                     let decisions = store.decisions(&server.name, &req.user);
                     // What the engine saw played comes first, then the artists of the albums the server lists as
-                    // recent: they cover the time before the engine was told about plays. Naming an artist twice
-                    // changes nothing, the mix tells artists apart by identity.
-                    let mut recent = plays::recent_artists(
+                    // recent: they cover the time before the engine was told about plays. An artist named in both
+                    // takes one place, so the albums fill what the plays leave free.
+                    let mut seen = HashSet::new();
+                    let recent: Vec<String> = plays::recent_artists(
                         &store.plays(&server.name, &req.user),
                         RECENT_ARTISTS,
-                    );
-                    recent.extend(req.recent.iter().cloned());
-                    recent.truncate(RECENT_ARTISTS);
+                    )
+                    .into_iter()
+                    .chain(req.recent.iter().cloned())
+                    .filter(|a| seen.insert(fold(a)))
+                    .take(RECENT_ARTISTS)
+                    .collect();
                     let mixes =
                         mix::recent_artist_mixes(&copy.songs, &recent, &decisions, MIX_SIZE)
                             .into_iter()
@@ -682,6 +710,50 @@ mod tests {
     fn a_play_report_that_is_not_one_is_refused() {
         let store = paired("bad-play");
         assert_eq!(call(&store, "/play", "{}".into(), Some("tok")).0, 400);
+        // Well formed, but it names no song, no artist or no user: nothing to seed a mix with.
+        assert_eq!(report_play(&store, "ana", "", "Queen", 1), 400);
+        assert_eq!(report_play(&store, "ana", "a1", " ", 1), 400);
+        assert_eq!(report_play(&store, " ", "a1", "Queen", 1), 400);
+        assert!(store.plays("home", "ana").is_empty());
+    }
+
+    #[test]
+    fn a_tail_that_cannot_be_read_is_kept_aside_and_not_written_over() {
+        let store = paired("corrupt");
+        let path = store.plays_path("home", "ana");
+        fs::write(&path, "{ not a list").unwrap();
+        assert_eq!(report_play(&store, "ana", "a1", "Queen", 1), 200);
+        assert_eq!(store.plays("home", "ana").len(), 1);
+        assert_eq!(
+            fs::read_to_string(path.with_extension("bad")).unwrap(),
+            "{ not a list"
+        );
+        store.forget_data("home");
+        assert!(!path.with_extension("bad").exists());
+    }
+
+    #[test]
+    fn an_artist_in_the_plays_and_the_albums_takes_one_place() {
+        let store = paired("dedup");
+        let mut songs = vec![];
+        for i in 0..15 {
+            songs.push(song(&format!("p{i}"), &format!("P{i}")));
+        }
+        for i in 0..5 {
+            songs.push(song(&format!("n{i}"), &format!("N{i}")));
+        }
+        upload(&store, "1@x", &[songs]);
+        for i in 0..15 {
+            report_play(&store, "ana", &format!("p{i}"), &format!("P{i}"), 100 + i);
+        }
+        // The albums name the same fifteen artists and five more: twenty in all, so none is cut off.
+        let albums: Vec<String> = (0..15)
+            .map(|i| format!("P{i}"))
+            .chain((0..5).map(|i| format!("N{i}")))
+            .collect();
+        let albums: Vec<&str> = albums.iter().map(String::as_str).collect();
+        let mixes = mix_songs(compute_recent(&store, "1@x", &albums));
+        assert!(mixes.iter().flatten().any(|id| id == "n4"), "{mixes:?}");
     }
 
     #[test]

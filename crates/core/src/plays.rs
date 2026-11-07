@@ -50,12 +50,14 @@ pub fn record(log: &mut Vec<Play>, play: Play) -> bool {
     if log.iter().any(|p| p.song == play.song && p.at == play.at) {
         return false;
     }
+    let (song, at) = (play.song.clone(), play.at);
     log.push(play);
     log.sort_by_key(|p| p.at); // stable: plays at the same second keep the order they arrived in
     if log.len() > KEEP {
         log.drain(..log.len() - KEEP);
     }
-    true
+    // A play older than all of a full log's plays is dropped at once: it was not recorded.
+    log.iter().any(|p| p.song == song && p.at == at)
 }
 
 /// The main artist of each play, most recent first, each once (spellings that differ only in case, accents or a joiner
@@ -125,6 +127,18 @@ mod tests {
         }
         assert_eq!(log.len(), KEEP);
         assert_eq!(log[0].song, "s3", "the oldest went first");
+    }
+
+    #[test]
+    fn a_play_older_than_a_full_log_is_not_recorded() {
+        let mut log = vec![];
+        for i in 0..KEEP as i64 {
+            record(&mut log, play(&format!("s{i}"), "A", 100 + i));
+        }
+        assert!(!record(&mut log, play("old", "A", 1)));
+        assert_eq!((log.len(), log[0].at), (KEEP, 100));
+        assert!(record(&mut log, play("new", "A", 1000)), "a newer one is");
+        assert_eq!((log.len(), log[0].at), (KEEP, 101));
     }
 
     #[test]
