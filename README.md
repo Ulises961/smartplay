@@ -91,8 +91,8 @@ artists they played last: about 60% songs of those artists and 40% songs of othe
 close to them. When the songs carry tags, the artists are split between the two mixes by how alike they are. They work
 for a user who has starred nothing, and they are ordinary playlists too.
 
-The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what is being
-played now. The engine keeps only the latest 500 plays of each user, with the song, its artists and the time: enough to
+The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what was played
+a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps only the latest 500 plays of each user, with the song, its artists and the time: enough to
 know what was played lately, not a history of listening. If the engine cannot be reached, Navidrome holds the play and
 sends it again. Before the engine has heard of any play, and for what was played before the plugin was installed, the
 mixes start from the artists of the albums the server lists as recently played.
