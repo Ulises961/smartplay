@@ -7,13 +7,11 @@ use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
     mix,
-    normalize::fold,
     plays::{self, Play},
     protocol::*,
     taste,
 };
 use std::{
-    collections::HashSet,
     fs,
     io::{Read, Write},
     path::PathBuf,
@@ -27,8 +25,6 @@ const PLAYLIST_SIZE: usize = 50;
 /// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
 const MIX_PLAYLIST: &str = "smartplay: mix";
 const MIX_SIZE: usize = 50;
-/// Artists a mix starts from at most: the latest ones played, then the ones of the albums the server lists as recent.
-const RECENT_ARTISTS: usize = 20;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
 #[derive(Serialize, Deserialize)]
@@ -114,8 +110,6 @@ impl Store {
     }
 
     /// What the server counted as played before the engine heard of any play; none when it was never taken.
-    // Read by the seeds of the mixes, which come next.
-    #[allow(dead_code)]
     fn baseline(&self, server: &str, user: &str) -> Option<plays::Baseline> {
         let text = fs::read_to_string(self.baseline_path(server, user)).ok()?;
         serde_json::from_str(&text).ok()
@@ -623,17 +617,11 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
             let answer = match store.library(&server.name, &req.user) {
                 Some(copy) if copy.fingerprint == req.fingerprint => {
                     let decisions = store.decisions(&server.name, &req.user);
-                    // What the engine saw played comes first, then the artists of the albums the server lists as
-                    // recent: they cover the time before the engine was told about plays. An artist named in both
-                    // takes one place, so the albums fill what the plays leave free.
+                    // The artists played most lately, and most of all; the albums the server lists as recent fill the
+                    // places the plays leave, for the time before the engine was told about plays.
                     let played = store.plays(&server.name, &req.user);
-                    let mut seen = HashSet::new();
-                    let recent: Vec<String> = plays::recent_artists(&played, RECENT_ARTISTS)
-                        .into_iter()
-                        .chain(req.recent.iter().cloned())
-                        .filter(|a| seen.insert(fold(a)))
-                        .take(RECENT_ARTISTS)
-                        .collect();
+                    let baseline = store.baseline(&server.name, &req.user);
+                    let recent = plays::seed_artists(&played, baseline.as_ref(), &req.recent);
                     let mixes = mix::recent_artist_mixes(
                         &copy.songs,
                         &recent,
@@ -1016,27 +1004,48 @@ mod tests {
     }
 
     #[test]
-    fn an_artist_in_the_plays_and_the_albums_takes_one_place() {
+    fn an_artist_in_the_plays_and_the_albums_takes_one_place_and_the_albums_fill_the_rest() {
         let store = paired("dedup");
-        let mut songs = vec![];
-        for i in 0..15 {
-            songs.push(song(&format!("p{i}"), &format!("P{i}")));
-        }
-        for i in 0..5 {
-            songs.push(song(&format!("n{i}"), &format!("N{i}")));
-        }
-        upload(&store, "1@x", &[songs]);
-        for i in 0..15 {
-            report_play(&store, "ana", &format!("p{i}"), &format!("P{i}"), 100 + i);
-        }
-        // The albums name the same fifteen artists and five more: twenty in all, so none is cut off.
-        let albums: Vec<String> = (0..15)
-            .map(|i| format!("P{i}"))
-            .chain((0..5).map(|i| format!("N{i}")))
+        let songs: Vec<taste::Song> = ["P0", "N0", "N1", "N2"]
+            .iter()
+            .map(|a| song(&a.to_lowercase(), a))
             .collect();
-        let albums: Vec<&str> = albums.iter().map(String::as_str).collect();
-        let mixes = mix_songs(compute_recent(&store, "1@x", &albums));
-        assert!(mixes.iter().flatten().any(|id| id == "n4"), "{mixes:?}");
+        upload(&store, "1@x", &[songs]);
+        report_play(&store, "ana", "p0", "P0", 100);
+        // P0 is in the plays and first in the albums: it takes one of the three places for the artists played lately,
+        // N0 and N1 fill the other two, and N2 is left out.
+        let mixes = mix_songs(compute_recent(&store, "1@x", &["P0", "N0", "N1", "N2"]));
+        let flat: Vec<&str> = mixes.iter().flatten().map(String::as_str).collect();
+        assert!(flat.contains(&"n1"), "{mixes:?}");
+        assert!(!flat.contains(&"n2"), "{mixes:?}");
+    }
+
+    #[test]
+    fn the_artists_counted_before_the_engine_heard_of_plays_seed_the_mixes_as_the_most_played_of_all(
+    ) {
+        let store = paired("all-time");
+        let counted = |id: &str, artist: &str, count: u32| taste::Song {
+            play_count: Some(count),
+            ..song(id, artist)
+        };
+        let mut songs = vec![
+            counted("fav1", "Old Favourite", 90),
+            counted("mid1", "Mid", 50),
+            counted("x1", "Hardly", 1),
+        ];
+        songs.extend((0..3).map(|i| song(&format!("r{i}"), &format!("R{i}"))));
+        upload(&store, "1@x", &[songs]);
+        for i in 0..3 {
+            report_play(&store, "ana", &format!("r{i}"), &format!("R{i}"), 100 + i);
+        }
+        let flat: Vec<String> = mix_songs(compute(&store, "1@x"))
+            .into_iter()
+            .flatten()
+            .collect();
+        // The plays are older than the counts (they are in them), so the all-time two are the two most counted.
+        assert!(flat.contains(&"fav1".to_string()), "{flat:?}");
+        assert!(flat.contains(&"mid1".to_string()), "{flat:?}");
+        assert!(!flat.contains(&"x1".to_string()), "{flat:?}");
     }
 
     #[test]
