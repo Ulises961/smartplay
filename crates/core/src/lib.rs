@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+pub mod enrich;
 pub mod identity;
 pub mod library;
 pub mod mix;
