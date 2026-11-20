@@ -135,6 +135,7 @@ pub fn recent_artist_mixes(
                 Some(a) if group.contains(a) => base.push(Candidate {
                     id: &song.id,
                     artist: Some(*a),
+                    song: song_key(song),
                     // Between 1 and 2: the latest artist leads, but not by so much that it crowds the others out.
                     score: 1.0 + 1.0 / (1 + rank(*a)) as f64,
                 }),
@@ -148,6 +149,7 @@ pub fn recent_artist_mixes(
                         similar.push(Candidate {
                             id: &song.id,
                             artist: *a,
+                            song: song_key(song),
                             score,
                         });
                     }
@@ -337,20 +339,41 @@ fn split(recent: &[usize], profiles: &HashMap<usize, Profile>) -> Vec<Vec<usize>
 struct Candidate<'a> {
     id: &'a str,
     artist: Option<usize>,
+    /// The song without what makes it a version of itself (see [`song_key`]): a demo and a live take of one song share it.
+    song: String,
     score: f64,
 }
 
+/// How much a version of a song already picked lowers the next: a second one counts for a fifth, a third for a ninth.
+const VARIANT_PENALTY: f64 = 4.0;
+
+/// The artist and title of a song, folded, without the part of the title after ` - ` or in brackets: `Tangled - Demo`,
+/// `Maps - Live In Manchester` and `Magic Dance (Remix)` are versions of `Tangled`, `Maps` and `Magic Dance`. They stay
+/// different songs; this only tells a mix not to fill itself with the variants of one.
+fn song_key(song: &Song) -> String {
+    let title = song.title.as_str();
+    let end = [" - ", " (", " ["]
+        .iter()
+        .filter_map(|cut| title.find(cut))
+        .min()
+        .unwrap_or(title.len());
+    format!("{}\u{1}{}", fold(&song.artist), fold(&title[..end]))
+}
+
 /// Up to `limit` ids, best first. Each pick lowers the next song of the same artist (its score is divided by one plus
-/// the songs already picked from that artist), so the list mixes artists instead of playing one out.
+/// the songs already picked from that artist), so the list mixes artists instead of playing one out, and lowers the versions
+/// of the same song much more, so that a demo, a live take and a remix of one song do not fill it.
 fn pick(mut candidates: Vec<Candidate>, limit: usize) -> Vec<String> {
     let mut picked_from: HashMap<usize, usize> = HashMap::new();
+    let mut picked_versions: HashMap<String, usize> = HashMap::new();
     let mut list = vec![];
     while list.len() < limit && !candidates.is_empty() {
         let weight = |c: &Candidate| {
             let taken = c
                 .artist
                 .map_or(0, |a| picked_from.get(&a).copied().unwrap_or(0));
-            c.score / (1 + taken) as f64
+            let versions = picked_versions.get(&c.song).copied().unwrap_or(0);
+            c.score / (1 + taken) as f64 / (1.0 + VARIANT_PENALTY * versions as f64)
         };
         let best = (0..candidates.len())
             .max_by(|&x, &y| {
@@ -363,6 +386,7 @@ fn pick(mut candidates: Vec<Candidate>, limit: usize) -> Vec<String> {
         if let Some(a) = chosen.artist {
             *picked_from.entry(a).or_default() += 1;
         }
+        *picked_versions.entry(chosen.song.clone()).or_default() += 1;
         list.push(chosen.id.to_string());
     }
     list
@@ -824,5 +848,42 @@ mod tests {
             mixes_enriched(&library, &["Band A"], &known)[0],
             ["a1", "t1", "c1"]
         );
+    }
+
+    #[test]
+    fn the_versions_of_a_song_are_told_by_what_follows_its_title() {
+        let key = |title: &str| {
+            let mut s = song("x", "Maroon 5", &[], &[]);
+            s.title = title.into();
+            song_key(&s)
+        };
+        assert_eq!(key("Tangled - Demo"), key("Tangled"));
+        assert_eq!(key("Maps - Live In Manchester"), key("maps"));
+        assert_eq!(key("Magic Dance (Danny S Remix)"), key("Magic Dance"));
+        assert_ne!(key("Maps"), key("Tangled"));
+        assert_ne!(key("Maps"), {
+            let mut s = song("x", "Other Band", &[], &[]);
+            s.title = "Maps".into();
+            song_key(&s)
+        });
+    }
+
+    #[test]
+    fn a_mix_does_not_fill_itself_with_the_versions_of_one_song() {
+        let version = |id: &str, title: &str| {
+            let mut s = song(id, "Band A", &[], &[]);
+            s.title = title.into();
+            s
+        };
+        let library = vec![
+            version("m1", "Maps"),
+            version("m2", "Maps - Live"),
+            version("m3", "Maps - Demo"),
+            version("t1", "Tangled"),
+            version("s1", "Shiver"),
+        ];
+        // Equal scores: without the penalty the three versions of Maps would come first, in the order of their ids.
+        let mix = &mixes(&library, &["Band A"], 3)[0];
+        assert_eq!(mix, &["m1", "s1", "t1"], "{mix:?}");
     }
 }
