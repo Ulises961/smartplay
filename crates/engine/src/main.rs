@@ -163,11 +163,25 @@ impl Store {
 
     /// Deletes everything a server holds about its users: library copies, decisions and plays.
     fn forget_data(&self, server: &str) {
-        let prefixes = [
+        self.forget(&[
             format!("library-{}-", hex(server)),
             format!("decisions-{}-", hex(server)),
             format!("plays-{}-", hex(server)),
-        ];
+        ]);
+    }
+
+    /// Deletes everything held about one user of a server: the library copy, the decisions and the history of plays.
+    fn forget_user(&self, server: &str, user: &str) {
+        let name = format!("{}-{}.", hex(server), hex(user));
+        self.forget(&[
+            format!("library-{name}"),
+            format!("decisions-{name}"),
+            format!("plays-{name}"),
+        ]);
+    }
+
+    /// Deletes the files of the data folder whose names start with any of `prefixes`.
+    fn forget(&self, prefixes: &[String]) {
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -181,6 +195,40 @@ impl Store {
             }
         }
     }
+
+    /// Adds the plays told by the lines of an import file (see `plays::from_import_line`) to a user's history.
+    fn import_plays(&self, server: &str, user: &str, source: &str, text: &str) -> ImportReport {
+        let mut report = ImportReport::default();
+        let mut plays = vec![];
+        for (n, line) in text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+        {
+            match plays::from_import_line(line, source) {
+                Ok(play) => plays.push(play),
+                Err(e) => report.invalid.push((n + 1, e)),
+            }
+        }
+        report.read = plays.len();
+        match self.play_log(server, user).append_many(plays) {
+            Ok(added) => report.added = added,
+            Err(e) => report.failed = Some(e),
+        }
+        report
+    }
+}
+
+/// What an import did.
+#[derive(Default, Debug)]
+struct ImportReport {
+    /// Lines that were plays.
+    read: usize,
+    /// Of those, the ones that were new.
+    added: usize,
+    /// Lines that were not, by line number, and why.
+    invalid: Vec<(usize, String)>,
+    failed: Option<String>,
 }
 
 fn now() -> u64 {
@@ -238,9 +286,12 @@ fn main() {
         ),
         Some("servers") => servers_command(store, &args[1..]),
         Some("artists") => artists_command(store, &args[1..]),
+        Some("import") => import_command(store, &args[1..]),
+        Some("purge") => purge_command(store, &args[1..]),
         _ => eprintln!(
             "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
-             smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER"
+             smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
+             smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
 }
@@ -252,13 +303,60 @@ fn positional(args: &[String]) -> Vec<&str> {
     for a in args {
         if skip {
             skip = false;
-        } else if a == "--data" || a == "--bind" {
+        } else if a == "--data" || a == "--bind" || a == "--source" {
             skip = true;
         } else {
             words.push(a.as_str());
         }
     }
     words
+}
+
+/// Adds the plays of a file of JSON lines to a user's history (the lines are described at `plays::from_import_line`).
+/// A play already kept is not added again, so running an import twice adds nothing the second time.
+fn import_command(store: Store, args: &[String]) {
+    let source = args
+        .iter()
+        .position(|a| a == "--source")
+        .and_then(|i| args.get(i + 1))
+        .map_or("file", String::as_str);
+    let words = positional(args);
+    let [server, user, file] = words.as_slice() else {
+        eprintln!("usage: import SERVER USER FILE [--source NAME]");
+        return;
+    };
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) => return eprintln!("{file}: {e}"),
+    };
+    let report = store.import_plays(server, user, source, &text);
+    for (line, why) in report.invalid.iter().take(10) {
+        eprintln!("line {line}: {why}");
+    }
+    if report.invalid.len() > 10 {
+        eprintln!("... and {} more lines", report.invalid.len() - 10);
+    }
+    if let Some(e) = report.failed {
+        return eprintln!("the history could not be written: {e}");
+    }
+    println!(
+        "{} plays read, {} new, {} already kept, {} lines that are not plays",
+        report.read,
+        report.added,
+        report.read - report.added,
+        report.invalid.len()
+    );
+}
+
+/// Deletes everything held about one user of a server: the library copy, the artist decisions and the history of plays.
+fn purge_command(store: Store, args: &[String]) {
+    match positional(args).as_slice() {
+        [server, user] => {
+            store.forget_user(server, user);
+            println!("deleted what is held about {user} on {server}");
+        }
+        _ => eprintln!("usage: purge SERVER USER"),
+    }
 }
 
 /// Artist names the user says are one artist or two, and what the library still leaves open. Names are matched as
@@ -739,6 +837,49 @@ mod tests {
         assert_eq!(report_play(&store, "ana", "p1", "Portishead", 1), 200);
         assert_eq!(store.plays("home", "ana").len(), 2);
         assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn an_import_adds_the_plays_of_a_file_once_and_names_the_lines_that_are_not_plays() {
+        let store = paired("import");
+        let at = now() - 3600;
+        let text = format!(
+            "{{\"at\":{at},\"artist\":\"Portishead\",\"title\":\"Glory Box\"}}\n\
+             \n\
+             not a play\n\
+             {{\"at\":{},\"artist\":\"Portishead\",\"title\":\"Roads\",\"listened_ms\":9000,\"track_ms\":300000}}\n",
+            at + 400
+        );
+        let first = store.import_plays("home", "ana", "spotify", &text);
+        assert_eq!((first.read, first.added, first.invalid.len()), (2, 2, 1));
+        assert_eq!(
+            first.invalid[0].0, 3,
+            "the line number counts the blank line"
+        );
+        let again = store.import_plays("home", "ana", "spotify", &text);
+        assert_eq!((again.read, again.added), (2, 0));
+        let kept = store.plays("home", "ana");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].source, "import:spotify");
+        assert_eq!(kept[1].ended(), Some(plays::Ended::Skip));
+    }
+
+    #[test]
+    fn a_purge_deletes_one_user_and_leaves_the_others() {
+        let store = paired("purge");
+        upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
+        store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
+        report_play(&store, "ana", "a1", "Queen", 100);
+        report_play(&store, "anabel", "a1", "Queen", 100);
+        store.forget_user("home", "ana");
+        assert!(store.library("home", "ana").is_none());
+        assert!(store.plays("home", "ana").is_empty());
+        assert_eq!(store.decisions("home", "ana"), Decisions::default());
+        assert_eq!(
+            store.plays("home", "anabel").len(),
+            1,
+            "a user whose name starts with the same letters is not touched"
+        );
     }
 
     #[test]
