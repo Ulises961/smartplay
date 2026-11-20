@@ -514,12 +514,17 @@ fn eval_command(store: Store, args: &[String]) {
             "the engine holds no library for {user} on {server}: run the plugin once"
         );
     };
+    let (played, baseline) = (store.plays(server, user), store.baseline(server, user));
+    let (decisions, cache) = (store.decisions(server, user), store.lastfm());
     let report = eval::evaluate(
-        &library.songs,
-        &store.plays(server, user),
-        store.baseline(server, user).as_ref(),
-        &[],
-        &store.decisions(server, user),
+        &eval::Input {
+            library: &library.songs,
+            played: &played,
+            baseline: baseline.as_ref(),
+            recent: &[],
+            decisions: &decisions,
+            enrichment: &cache.known,
+        },
         number("--size", MIX_SIZE as i64) as usize,
         number("--holdout-days", 14),
     );
@@ -757,6 +762,7 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                         &recent,
                         &played,
                         &decisions,
+                        &store.lastfm().known,
                         MIX_SIZE,
                     )
                     .into_iter()
@@ -1065,6 +1071,39 @@ mod tests {
         assert_eq!(store.baseline("home", "ana").unwrap().tallies[0].count, 7);
         store.forget_user("home", "ana");
         assert!(store.baseline("home", "ana").is_none());
+    }
+
+    #[test]
+    fn what_last_fm_said_of_the_artists_widens_the_mixes_for_every_user() {
+        let store = paired("lastfm");
+        upload(
+            &store,
+            "1@x",
+            &[vec![
+                song("p1", "Portishead"),
+                song("m1", "Massive Attack"),
+                song("r1", "Radiohead"),
+            ]],
+        );
+        report_play(&store, "ana", "p1", "Portishead", 100);
+        assert_eq!(
+            mix_songs(compute(&store, "1@x")),
+            vec![vec!["p1".to_string()]]
+        );
+
+        let info = |tag: &str| smartplay_core::enrich::ArtistInfo {
+            tags: vec![(tag.to_string(), 1.0)],
+            similar: vec![],
+        };
+        let mut cache = lastfm::Cache::default();
+        cache.known.insert("Portishead", info("trip hop"));
+        cache.known.insert("Massive Attack", info("trip hop"));
+        cache.known.insert("Radiohead", info("rock"));
+        store.save_lastfm(&cache).unwrap();
+        assert_eq!(
+            mix_songs(compute(&store, "1@x")),
+            vec![vec!["p1".to_string(), "m1".to_string()]]
+        );
     }
 
     #[test]
