@@ -73,6 +73,32 @@ impl PlayLog {
         Ok(true)
     }
 
+    /// Adds the plays that are not kept yet, in one write. Returns how many were new. Unlike [`PlayLog::append`] this looks
+    /// through the whole history, since an import may hold plays of any age.
+    pub fn append_many(&self, plays: Vec<Play>) -> Result<usize, String> {
+        let mut log = self.load();
+        let added = plays::merge_new(&mut log, plays);
+        if added.is_empty() {
+            return Ok(0);
+        }
+        let mut lines = String::new();
+        for play in &added {
+            lines.push_str(&serde_json::to_string(play).map_err(|e| e.to_string())?);
+            lines.push('\n');
+        }
+        if !self.ends_in_newline() {
+            lines.insert(0, '\n');
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| e.to_string())?;
+        file.write_all(lines.as_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(added.len())
+    }
+
     /// Drops the plays older than `retention` seconds before `now`, when the oldest is far enough past it to be worth a
     /// rewrite. Lines that cannot be read are kept. Returns whether the file was rewritten.
     pub fn compact(&self, now: i64, retention: i64) -> Result<bool, String> {
@@ -193,6 +219,16 @@ mod tests {
         assert!(log.append(&play("s1", 100)).unwrap());
         let songs: Vec<String> = log.load().into_iter().map(|p| p.song).collect();
         assert_eq!(songs, ["s1", "s2"]);
+    }
+
+    #[test]
+    fn many_plays_are_added_at_once_and_a_second_time_adds_none() {
+        let log = log("many");
+        log.append(&play("s1", 100)).unwrap();
+        let batch = vec![play("s1", 102), play("s2", 200), play("s3", 300)];
+        assert_eq!(log.append_many(batch.clone()).unwrap(), 2);
+        assert_eq!(log.append_many(batch).unwrap(), 0);
+        assert_eq!(log.load().len(), 3);
     }
 
     #[test]
