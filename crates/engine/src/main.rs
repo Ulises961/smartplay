@@ -1,6 +1,8 @@
 //! Engine: registered servers, one-time enrollment codes, bearer tokens. Answers each granted user with a playlist.
 //! State is a JSON file so the `servers` commands (separate processes) and `serve` share it.
 
+mod history;
+
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
@@ -131,42 +133,32 @@ impl Store {
 
     fn plays_path(&self, server: &str, user: &str) -> PathBuf {
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
-        dir.join(format!("plays-{}-{}.json", hex(server), hex(user)))
+        dir.join(format!("plays-{}-{}.jsonl", hex(server), hex(user)))
     }
 
-    /// The tail of plays kept for a user, oldest first; empty when there is no file or it cannot be read.
+    fn play_log(&self, server: &str, user: &str) -> history::PlayLog {
+        history::PlayLog::new(self.plays_path(server, user))
+    }
+
+    /// The plays kept for a user, oldest first; empty when there are none.
     fn plays(&self, server: &str, user: &str) -> Vec<Play> {
-        fs::read_to_string(self.plays_path(server, user))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        self.play_log(server, user).load()
     }
 
-    /// Adds a play to the user's tail. Returns whether it was new.
+    /// Adds a play to the user's history and drops what is past the retention. Returns whether it was new.
     fn record_play(&self, server: &str, user: &str, play: Play) -> Result<bool, String> {
-        let path = self.plays_path(server, user);
-        let mut log = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                // Never write over a tail that cannot be read: keep it for the operator and start a new one.
-                let aside = path.with_extension("bad");
+        let log = self.play_log(server, user);
+        let new = log.append(&play)?;
+        if new {
+            // A failed rewrite loses nothing: the next play tries again.
+            if let Err(e) = log.compact(now() as i64, plays::RETENTION) {
                 eprintln!(
-                    "{}: unreadable ({e}); kept as {}",
-                    path.display(),
-                    aside.display()
+                    "{}: not compacted: {e}",
+                    self.plays_path(server, user).display()
                 );
-                let _ = fs::rename(&path, aside);
-                vec![]
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(e.to_string()),
-        };
-        if !plays::record(&mut log, play) {
-            return Ok(false);
+            }
         }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_string(&log).unwrap()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(new)
     }
 
     /// Deletes everything a server holds about its users: library copies, decisions and plays.
@@ -640,13 +632,14 @@ mod tests {
         );
     }
 
+    /// A play `at` seconds after a moment two months ago: the history keeps two years, and a test's plays must be recent.
     fn report_play(store: &Store, user: &str, song: &str, artist: &str, at: i64) -> u16 {
         let body = serde_json::to_string(&PlayReport {
             user: user.into(),
             play: Play {
                 song: song.into(),
                 artists: vec![artist.into()],
-                at,
+                at: now() as i64 - 60 * 24 * 3600 + at,
                 ..Play::default()
             },
         })
@@ -718,18 +711,52 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_that_cannot_be_read_is_kept_aside_and_not_written_over() {
+    fn a_history_that_cannot_be_read_is_kept_aside_and_not_written_over() {
         let store = paired("corrupt");
-        let path = store.plays_path("home", "ana");
-        fs::write(&path, "{ not a list").unwrap();
+        let legacy = store.plays_path("home", "ana").with_extension("json");
+        fs::write(&legacy, "{ not a list").unwrap();
         assert_eq!(report_play(&store, "ana", "a1", "Queen", 1), 200);
         assert_eq!(store.plays("home", "ana").len(), 1);
         assert_eq!(
-            fs::read_to_string(path.with_extension("bad")).unwrap(),
+            fs::read_to_string(legacy.with_extension("bad")).unwrap(),
             "{ not a list"
         );
         store.forget_data("home");
-        assert!(!path.with_extension("bad").exists());
+        assert!(!legacy.with_extension("bad").exists());
+    }
+
+    #[test]
+    fn a_history_kept_as_a_list_is_moved_into_the_file_of_lines_when_the_next_play_comes() {
+        let store = paired("legacy");
+        let legacy = store.plays_path("home", "ana").with_extension("json");
+        let old = Play {
+            song: "a1".into(),
+            artists: vec!["Queen".into()],
+            at: now() as i64 - 1000,
+            ..Play::default()
+        };
+        fs::write(&legacy, serde_json::to_string(&[old]).unwrap()).unwrap();
+        assert_eq!(report_play(&store, "ana", "p1", "Portishead", 1), 200);
+        assert_eq!(store.plays("home", "ana").len(), 2);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn plays_of_songs_the_server_does_not_hold_are_kept() {
+        let store = paired("elsewhere");
+        let body = serde_json::to_string(&PlayReport {
+            user: "ana".into(),
+            play: Play {
+                artists: vec!["Portishead".into()],
+                title: "Glory Box".into(),
+                at: now() as i64 - 100,
+                source: "import:spotify".into(),
+                ..Play::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(call(&store, "/play", body, Some("tok")).0, 200);
+        assert_eq!(store.plays("home", "ana")[0].title, "Glory Box");
     }
 
     #[test]
