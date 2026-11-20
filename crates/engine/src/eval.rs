@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use smartplay_core::{
+    enrich::Enrichment,
     identity::Decisions,
     mix,
     normalize::fold,
@@ -32,6 +33,8 @@ pub struct Report {
     /// The mixes now, as lines of `artist - title`.
     pub mixes: Vec<Vec<String>>,
     pub holdout: Option<Holdout>,
+    /// The same check made without what outside services say, when something is known of the artists: what they add.
+    pub holdout_without_enrichment: Option<Holdout>,
     /// The share of the library that is in the mixes.
     pub coverage: f64,
     /// The share of the songs of the mixes that are of the artist with most songs in them.
@@ -102,16 +105,28 @@ impl<'a> Index<'a> {
     }
 }
 
-/// The mixes for `library` and the history `played` (in time order), and the check against the last `holdout_days` of it.
-pub fn evaluate(
-    library: &[Song],
-    played: &[Play],
-    baseline: Option<&Baseline>,
-    recent: &[String],
-    decisions: &Decisions,
-    size: usize,
-    holdout_days: i64,
-) -> Report {
+/// What the mixes are made from.
+pub struct Input<'a> {
+    pub library: &'a [Song],
+    /// The history, in time order.
+    pub played: &'a [Play],
+    pub baseline: Option<&'a Baseline>,
+    /// The artists of the albums the server lists as recent; none when it cannot be asked.
+    pub recent: &'a [String],
+    pub decisions: &'a Decisions,
+    pub enrichment: &'a Enrichment,
+}
+
+/// The mixes for `input`, and the check against the last `holdout_days` of its history.
+pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
+    let Input {
+        library,
+        played,
+        baseline,
+        recent,
+        decisions,
+        enrichment,
+    } = *input;
     let index = Index::new(library);
     let name_of: HashMap<&str, String> = library
         .iter()
@@ -119,7 +134,7 @@ pub fn evaluate(
         .collect();
 
     let seeds = plays::seed_artists(played, baseline, recent);
-    let mixes = mix::recent_artist_mixes(library, &seeds, played, decisions, size);
+    let mixes = mix::recent_artist_mixes(library, &seeds, played, decisions, enrichment, size);
 
     let in_mixes: HashSet<&str> = mixes.iter().flatten().map(String::as_str).collect();
     let mut per_artist: HashMap<String, usize> = HashMap::new();
@@ -157,43 +172,61 @@ pub fn evaluate(
             })
             .collect(),
         holdout: None,
+        holdout_without_enrichment: None,
     };
 
-    if let Some(latest) = played.last().map(|p| p.at) {
-        let cutoff = latest - holdout_days * DAY;
-        let split = played.partition_point(|p| p.at < cutoff);
-        let (before, hidden) = played.split_at(split);
-        if !before.is_empty() && !hidden.is_empty() {
-            let seeds = plays::seed_artists(before, baseline, &[]);
-            let mixes = mix::recent_artist_mixes(library, &seeds, before, decisions, size);
-            let songs: HashSet<&str> = mixes.iter().flatten().map(String::as_str).collect();
-            let artists: HashSet<String> = songs
-                .iter()
-                .filter_map(|id| index.by_id.get(id))
-                .map(|s| fold(&s.artist))
-                .collect();
-            let artist_count = library
-                .iter()
-                .map(|s| fold(&s.artist))
-                .collect::<HashSet<_>>()
-                .len();
-            let (mut tested, mut song_hits, mut artist_hits) = (0, 0, 0);
-            for song in hidden.iter().filter_map(|p| index.find(p)) {
-                tested += 1;
-                song_hits += usize::from(songs.contains(song.id.as_str()));
-                artist_hits += usize::from(artists.contains(&fold(&song.artist)));
-            }
-            report.holdout = Some(Holdout {
-                days: holdout_days,
-                tested,
-                song_hits,
-                artist_hits,
-                song_chance: ratio(songs.len(), library.len()),
-                artist_chance: ratio(artists.len(), artist_count),
-            });
-        }
+    report.holdout = holdout(input, enrichment, size, holdout_days);
+    if !enrichment.is_empty() {
+        report.holdout_without_enrichment =
+            holdout(input, &Enrichment::default(), size, holdout_days);
     }
     report
+}
+
+/// Hides the plays of the last `days` days, builds the mixes from the plays before and counts the hidden plays that land on
+/// a song or an artist of the mixes. `None` when there is no history on both sides of the cut.
+fn holdout(input: &Input, enrichment: &Enrichment, size: usize, days: i64) -> Option<Holdout> {
+    let Input {
+        library,
+        played,
+        baseline,
+        decisions,
+        ..
+    } = *input;
+    let index = Index::new(library);
+    let latest = played.last()?.at;
+    let split = played.partition_point(|p| p.at < latest - days * DAY);
+    let (before, hidden) = played.split_at(split);
+    if before.is_empty() || hidden.is_empty() {
+        return None;
+    }
+    let seeds = plays::seed_artists(before, baseline, &[]);
+    let mixes = mix::recent_artist_mixes(library, &seeds, before, decisions, enrichment, size);
+    let songs: HashSet<&str> = mixes.iter().flatten().map(String::as_str).collect();
+    let artists: HashSet<String> = songs
+        .iter()
+        .filter_map(|id| index.by_id.get(id))
+        .map(|s| fold(&s.artist))
+        .collect();
+    let artist_count = library
+        .iter()
+        .map(|s| fold(&s.artist))
+        .collect::<HashSet<_>>()
+        .len();
+    let (mut tested, mut song_hits, mut artist_hits) = (0, 0, 0);
+    for song in hidden.iter().filter_map(|p| index.find(p)) {
+        tested += 1;
+        song_hits += usize::from(songs.contains(song.id.as_str()));
+        artist_hits += usize::from(artists.contains(&fold(&song.artist)));
+    }
+    Some(Holdout {
+        days,
+        tested,
+        song_hits,
+        artist_hits,
+        song_chance: ratio(songs.len(), library.len()),
+        artist_chance: ratio(artists.len(), artist_count),
+    })
 }
 
 fn ratio(part: usize, whole: usize) -> f64 {
@@ -258,6 +291,16 @@ impl Report {
                 let _ = writeln!(out, "hold-out: not enough history on both sides of the cut");
             }
         }
+        if let (Some(with), Some(without)) = (&self.holdout, &self.holdout_without_enrichment) {
+            let _ = writeln!(
+                out,
+                "without what Last.fm says: songs lift {:.1} (with it {:.1}), artists lift {:.1} (with it {:.1})",
+                without.song_lift(),
+                with.song_lift(),
+                without.artist_lift(),
+                with.artist_lift()
+            );
+        }
         out
     }
 }
@@ -302,6 +345,22 @@ mod tests {
         songs
     }
 
+    /// The report for a library and a history, with nothing else known.
+    fn report(library: &[Song], played: &[Play]) -> Report {
+        evaluate(
+            &Input {
+                library,
+                played,
+                baseline: None,
+                recent: &[],
+                decisions: &Decisions::default(),
+                enrichment: &Enrichment::default(),
+            },
+            10,
+            14,
+        )
+    }
+
     #[test]
     fn a_user_who_keeps_to_one_style_is_predicted_better_than_chance() {
         let library = library();
@@ -314,7 +373,7 @@ mod tests {
                 day * DAY,
             ));
         }
-        let report = evaluate(&library, &played, None, &[], &Decisions::default(), 10, 14);
+        let report = report(&library, &played);
         let h = report
             .holdout
             .as_ref()
@@ -328,7 +387,7 @@ mod tests {
 
     #[test]
     fn with_no_history_there_is_nothing_to_predict_and_the_report_says_so() {
-        let report = evaluate(&library(), &[], None, &[], &Decisions::default(), 10, 14);
+        let report = report(&library(), &[]);
         assert!(report.holdout.is_none());
         assert!(report.mixes.is_empty());
         assert!(report.render().contains("not enough history"));
@@ -341,15 +400,7 @@ mod tests {
         stranger.song = String::new();
         stranger.artists = vec!["Nobody".into()];
         stranger.title = "Unknown".into();
-        let report = evaluate(
-            &library,
-            &[play(&library[0], 50), stranger],
-            None,
-            &[],
-            &Decisions::default(),
-            10,
-            14,
-        );
+        let report = report(&library, &[play(&library[0], 50), stranger]);
         assert_eq!((report.plays, report.matched_plays), (2, 1));
     }
 
@@ -358,7 +409,7 @@ mod tests {
         let mut library = library();
         library[0].year = Some(1994);
         library[1].genres.clear();
-        let report = evaluate(&library, &[], None, &[], &Decisions::default(), 10, 14);
+        let report = report(&library, &[]);
         assert_eq!(
             (report.songs, report.with_tags, report.with_year),
             (40, 39, 1)
