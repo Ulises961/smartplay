@@ -464,12 +464,8 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 let Ok(report) = serde_json::from_str::<PlayReport>(body) else {
                     return (400, "bad request".into());
                 };
-                // A play that names no song or no artist seeds nothing and would only take one of the kept places.
-                let play = &report.play;
-                if report.user.trim().is_empty()
-                    || play.song.trim().is_empty()
-                    || play.artists.iter().all(|a| a.trim().is_empty())
-                {
+                // A play that names no song (by id or by title) or no artist seeds nothing and would only take room.
+                if report.user.trim().is_empty() || !report.play.is_usable() {
                     return (400, "a play needs a user, a song and an artist".into());
                 }
                 return match store.record_play(&server.name, &report.user, report.play) {
@@ -651,6 +647,7 @@ mod tests {
                 song: song.into(),
                 artists: vec![artist.into()],
                 at,
+                ..Play::default()
             },
         })
         .unwrap();

@@ -1,7 +1,9 @@
 //! The plays the engine has been told about, newest last, and what a mix takes from them.
 //!
-//! Only a short tail is kept per user ([`KEEP`] plays): enough to know what was played lately, not a history of the
-//! user's listening.
+//! A play is a neutral event: the song (by its id on the server when it is known, else by artist and title), when it
+//! started, and, when the source knows them, how much was heard and how it ended. Plays of songs the server does not
+//! hold are kept too: what a user plays elsewhere says as much about their taste. Plays are kept for [`RETENTION`]
+//! and then dropped; nothing here needs the history to be long, and every field beyond the song and the time is optional.
 
 use std::collections::HashSet;
 
@@ -9,18 +11,55 @@ use serde::{Deserialize, Serialize};
 
 use crate::normalize::fold;
 
-/// Plays kept per user; recording another drops the oldest.
-pub const KEEP: usize = 500;
+/// How long a play is kept: two years.
+pub const RETENTION: i64 = 2 * 365 * 24 * 60 * 60;
 
-/// One completed play.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// Two reports of one song whose starts are this many seconds apart or less are one play: a server that could not be sure
+/// the engine heard a play sends it again, and two sources may both tell about it.
+pub const DUPLICATE_WINDOW: i64 = 10;
+
+/// Less than this share of a track heard is a skip, and this share or more is a play heard in full.
+pub const SKIP_BELOW: f64 = 0.35;
+pub const FULL_FROM: f64 = 0.9;
+
+/// How a play ended.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ended {
+    /// Cut short: the user changed the song almost at once.
+    Skip,
+    /// Heard for a good while, not to the end.
+    Heard,
+    /// Heard to the end, or nearly.
+    Full,
+}
+
+/// One play.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Play {
-    /// The song's id on the server.
+    /// The song's id on the server; empty when the source does not know the server (a play elsewhere).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub song: String,
     /// The artists credited on the song, the main one first.
     pub artists: Vec<String>,
     /// When the song started playing, in seconds since the epoch.
     pub at: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub album: String,
+    /// How much of the song was heard, in milliseconds, when the source says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listened_ms: Option<u64>,
+    /// How long the song is, in milliseconds, when the source says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_ms: Option<u64>,
+    /// How the play ended, when the source says; otherwise [`Play::ended`] works it out from the two times above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<Ended>,
+    /// Where the play came from (`scrobbler`, `import:NAME`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 impl Play {
@@ -40,24 +79,70 @@ impl Play {
             song: song.into(),
             artists,
             at,
+            ..Play::default()
         }
+    }
+
+    /// How the play ended: what the source said, else a skip, a play heard or one heard in full by the share of the song
+    /// that was heard, else nothing (a source that reports only finished plays does not say).
+    pub fn ended(&self) -> Option<Ended> {
+        if self.ended.is_some() {
+            return self.ended;
+        }
+        let share = self.listened_ms? as f64 / self.track_ms.filter(|&t| t > 0)? as f64;
+        Some(if share < SKIP_BELOW {
+            Ended::Skip
+        } else if share < FULL_FROM {
+            Ended::Heard
+        } else {
+            Ended::Full
+        })
+    }
+
+    /// Whether the play names a song (by id, or by title) and an artist: otherwise it says nothing a mix can use.
+    pub fn is_usable(&self) -> bool {
+        (!self.song.trim().is_empty() || !self.title.trim().is_empty())
+            && main_artist(self).is_some()
     }
 }
 
-/// Adds `play` to `log`, keeping it in time order and at most [`KEEP`] long. Returns `false`, changing nothing, when
-/// the same song at the same time is already there: a server that could not be sure the engine heard a play sends it again.
+/// Whether both plays are of one song: the same id on the server, or, when either has none, the same main artist and title.
+/// Versions of a song (a remix, a live take) are other songs.
+fn same_song(a: &Play, b: &Play) -> bool {
+    if !a.song.is_empty() && !b.song.is_empty() {
+        return a.song == b.song;
+    }
+    let title = |p: &Play| fold(&p.title);
+    let artist = |p: &Play| main_artist(p).map(fold);
+    !title(a).is_empty() && title(a) == title(b) && artist(a).is_some() && artist(a) == artist(b)
+}
+
+/// Whether `a` and `b` are one play told twice.
+pub fn same_play(a: &Play, b: &Play) -> bool {
+    (a.at - b.at).abs() <= DUPLICATE_WINDOW && same_song(a, b)
+}
+
+/// Adds `play` to `log`, keeping it in time order. Returns `false`, changing nothing, when the same play is there.
 pub fn record(log: &mut Vec<Play>, play: Play) -> bool {
-    if log.iter().any(|p| p.song == play.song && p.at == play.at) {
+    if log.iter().any(|p| same_play(p, &play)) {
         return false;
     }
-    let (song, at) = (play.song.clone(), play.at);
     log.push(play);
     log.sort_by_key(|p| p.at); // stable: plays at the same second keep the order they arrived in
-    if log.len() > KEEP {
-        log.drain(..log.len() - KEEP);
-    }
-    // A play older than all of a full log's plays is dropped at once: it was not recorded.
-    log.iter().any(|p| p.song == song && p.at == at)
+    true
+}
+
+/// Drops the plays older than `retention` seconds before `now`.
+pub fn prune(log: &mut Vec<Play>, now: i64, retention: i64) {
+    log.retain(|p| p.at >= now - retention);
+}
+
+/// The main artist of a play: the first one credited.
+fn main_artist(play: &Play) -> Option<&str> {
+    play.artists
+        .iter()
+        .map(|a| a.trim())
+        .find(|a| !a.is_empty())
 }
 
 /// The main artist of each play, most recent first, each once (spellings that differ only in case, accents or a joiner
@@ -66,7 +151,7 @@ pub fn recent_artists(log: &[Play], limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
     log.iter()
         .rev()
-        .filter_map(|p| p.artists.iter().map(|a| a.trim()).find(|a| !a.is_empty()))
+        .filter_map(main_artist)
         .filter(|a| seen.insert(fold(a)))
         .take(limit)
         .map(String::from)
@@ -102,6 +187,17 @@ mod tests {
             song: song.into(),
             artists: vec![artist.into()],
             at,
+            ..Play::default()
+        }
+    }
+
+    /// A play of a song the server does not hold: named, not identified.
+    fn elsewhere(artist: &str, title: &str, at: i64) -> Play {
+        Play {
+            artists: vec![artist.into()],
+            title: title.into(),
+            at,
+            ..Play::default()
         }
     }
 
@@ -122,10 +218,72 @@ mod tests {
         assert!(record(&mut log, play("s1", "A", 10)));
         assert!(!record(&mut log, play("s1", "A", 10)));
         assert!(
-            record(&mut log, play("s1", "A", 11)),
+            !record(&mut log, play("s1", "A", 10 + DUPLICATE_WINDOW)),
+            "a start a few seconds off is the same play"
+        );
+        assert!(
+            record(&mut log, play("s1", "A", 11 + DUPLICATE_WINDOW)),
             "the same song again later is a new play"
         );
         assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn two_sources_telling_of_one_play_make_one_even_when_only_one_knows_the_server() {
+        let mut log = vec![];
+        let mut known = play("s1", "Sigur Rós", 1000);
+        known.title = "Hoppípolla".into();
+        assert!(record(&mut log, known));
+        assert!(
+            !record(&mut log, elsewhere("sigur ros", "hoppipolla", 1004)),
+            "the same artist and title, spelled differently"
+        );
+        assert!(
+            record(&mut log, elsewhere("Sigur Rós", "Hoppípolla (live)", 1004)),
+            "a live take is another song"
+        );
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn plays_of_songs_the_server_does_not_hold_are_usable_when_they_name_a_title_and_an_artist() {
+        assert!(elsewhere("A", "T", 1).is_usable());
+        assert!(play("s1", "A", 1).is_usable());
+        assert!(!elsewhere(" ", "T", 1).is_usable());
+        assert!(!elsewhere("A", " ", 1).is_usable());
+        assert!(!play("", "A", 1).is_usable());
+    }
+
+    #[test]
+    fn how_a_play_ended_is_what_the_source_says_or_the_share_heard() {
+        let heard = |listened: u64, track: u64| Play {
+            listened_ms: Some(listened),
+            track_ms: Some(track),
+            ..play("s", "A", 1)
+        };
+        assert_eq!(heard(10_000, 200_000).ended(), Some(Ended::Skip));
+        assert_eq!(heard(100_000, 200_000).ended(), Some(Ended::Heard));
+        assert_eq!(heard(190_000, 200_000).ended(), Some(Ended::Full));
+        assert_eq!(
+            heard(400_000, 200_000).ended(),
+            Some(Ended::Full),
+            "repeated"
+        );
+        let said = Play {
+            ended: Some(Ended::Skip),
+            ..heard(190_000, 200_000)
+        };
+        assert_eq!(said.ended(), Some(Ended::Skip), "the source's word wins");
+        assert_eq!(play("s", "A", 1).ended(), None, "nothing is known");
+        assert_eq!(heard(5, 0).ended(), None, "a track of no length");
+    }
+
+    #[test]
+    fn a_play_without_the_optional_fields_stays_small_and_reads_back() {
+        let line = serde_json::to_string(&play("s1", "A", 5)).unwrap();
+        assert_eq!(line, r#"{"song":"s1","artists":["A"],"at":5}"#);
+        let old: Play = serde_json::from_str(&line).unwrap();
+        assert_eq!(old, play("s1", "A", 5));
     }
 
     #[test]
@@ -140,25 +298,27 @@ mod tests {
     }
 
     #[test]
-    fn only_the_latest_plays_are_kept() {
-        let mut log = vec![];
-        for i in 0..(KEEP as i64 + 3) {
-            record(&mut log, play(&format!("s{i}"), "A", i));
-        }
-        assert_eq!(log.len(), KEEP);
-        assert_eq!(log[0].song, "s3", "the oldest went first");
+    fn plays_older_than_the_retention_are_dropped_and_the_rest_kept() {
+        let now = 10 * RETENTION;
+        let mut log = vec![
+            play("old", "A", now - RETENTION - 1),
+            play("edge", "A", now - RETENTION),
+            play("new", "A", now),
+        ];
+        prune(&mut log, now, RETENTION);
+        assert_eq!(
+            log.iter().map(|p| p.song.as_str()).collect::<Vec<_>>(),
+            ["edge", "new"]
+        );
     }
 
     #[test]
-    fn a_play_older_than_a_full_log_is_not_recorded() {
+    fn a_long_history_is_kept_whole() {
         let mut log = vec![];
-        for i in 0..KEEP as i64 {
-            record(&mut log, play(&format!("s{i}"), "A", 100 + i));
+        for i in 0..2000 {
+            record(&mut log, play(&format!("s{i}"), "A", i * 100));
         }
-        assert!(!record(&mut log, play("old", "A", 1)));
-        assert_eq!((log.len(), log[0].at), (KEEP, 100));
-        assert!(record(&mut log, play("new", "A", 1000)), "a newer one is");
-        assert_eq!((log.len(), log[0].at), (KEEP, 101));
+        assert_eq!(log.len(), 2000);
     }
 
     #[test]
@@ -202,6 +362,7 @@ mod tests {
             song: "s1".into(),
             artists: vec![" ".into(), "Lead".into(), "Guest".into()],
             at: 1,
+            ..Play::default()
         }];
         assert_eq!(recent_artists(&log, 5), ["Lead"]);
     }
