@@ -361,33 +361,26 @@ fn main() {
         Some("purge") => purge_command(store, &args[1..]),
         Some("eval") => eval_command(store, &args[1..]),
         Some("enrich") => enrich_command(store, &args[1..]),
+        Some("import-lastfm") => import_lastfm_command(store, &args[1..]),
         _ => eprintln!(
             "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
              smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
+             smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
              smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
 }
 
-/// The words of a command, without the `--flag VALUE` pairs the engine itself takes.
+/// The words of a command, without its `--flag VALUE` pairs (every flag the engine has takes a value).
 fn positional(args: &[String]) -> Vec<&str> {
     let mut words = vec![];
     let mut skip = false;
     for a in args {
         if skip {
             skip = false;
-        } else if [
-            "--data",
-            "--bind",
-            "--source",
-            "--size",
-            "--holdout-days",
-            "--limit",
-        ]
-        .contains(&a.as_str())
-        {
+        } else if a.starts_with("--") {
             skip = true;
         } else {
             words.push(a.as_str());
@@ -492,6 +485,43 @@ fn enrich_command(store: Store, args: &[String]) {
     );
     if let Some(why) = total.stopped {
         eprintln!("stopped: Last.fm could not answer ({why}); run it again later to go on");
+    }
+}
+
+/// Adds the plays of a user's Last.fm history to their history here: what they heard anywhere, not only on this server. It
+/// is opt-in (the key in `SMARTPLAY_LASTFM_KEY`, and the Last.fm name is given by the operator) and a play already kept is
+/// not added again, so it can be run again to bring in what is newer.
+fn import_lastfm_command(store: Store, args: &[String]) {
+    let Some(key) = std::env::var("SMARTPLAY_LASTFM_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return eprintln!("set SMARTPLAY_LASTFM_KEY to import a Last.fm history");
+    };
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+    };
+    let words = positional(args);
+    let ([server, user], Some(lastfm_user)) = (words.as_slice(), flag("--lastfm-user")) else {
+        return eprintln!("usage: import-lastfm SERVER USER --lastfm-user NAME [--pages N]");
+    };
+    let pages = flag("--pages")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u32::MAX);
+    let client = lastfm::Client::new(key.trim());
+    let (plays, stopped) = lastfm::fetch_history(&client, lastfm_user, pages);
+    let read = plays.len();
+    match store.play_log(server, user).append_many(plays) {
+        Ok(added) => println!(
+            "{read} plays read from Last.fm, {added} new, {} already kept",
+            read - added
+        ),
+        Err(e) => return eprintln!("the history could not be written: {e}"),
+    }
+    if let Some(why) = stopped {
+        eprintln!("stopped: {why}; run it again later to go on (what was read is kept)");
     }
 }
 

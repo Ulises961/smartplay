@@ -15,6 +15,7 @@ use smartplay_core::{
     enrich::{self, ArtistInfo, Enrichment, Failure},
     normalize::fold,
     plays::{Baseline, Play},
+    scrobbles::{self, Page},
     taste::Song,
 };
 
@@ -62,22 +63,23 @@ impl Client {
         }
     }
 
-    fn get(&self, method: &str, artist: &str) -> Result<String, Failure> {
+    fn get(&self, method: &str, params: &[(&str, &str)]) -> Result<String, Failure> {
         if let Some(last) = self.last.get() {
             if let Some(wait) = self.gap.checked_sub(last.elapsed()) {
                 std::thread::sleep(wait);
             }
         }
         self.last.set(Some(Instant::now()));
-        let mut response = self
+        let mut request = self
             .agent
             .get(&self.base)
             .query("method", method)
-            .query("artist", artist)
             .query("api_key", &self.key)
-            .query("format", "json")
-            .query("autocorrect", "1")
-            .query("limit", "30")
+            .query("format", "json");
+        for (name, value) in params {
+            request = request.query(name, value);
+        }
+        let mut response = request
             .call()
             .map_err(|e| Failure::Temporary(e.to_string()))?;
         response
@@ -89,10 +91,52 @@ impl Client {
 
 impl Lookup for Client {
     fn info(&self, artist: &str) -> Result<ArtistInfo, Failure> {
-        let tags = enrich::parse_top_tags(&self.get("artist.getTopTags", artist)?)?;
-        let similar = enrich::parse_similar(&self.get("artist.getSimilar", artist)?)?;
+        let about = [("artist", artist), ("autocorrect", "1"), ("limit", "30")];
+        let tags = enrich::parse_top_tags(&self.get("artist.getTopTags", &about)?)?;
+        let similar = enrich::parse_similar(&self.get("artist.getSimilar", &about)?)?;
         Ok(ArtistInfo { tags, similar })
     }
+}
+
+/// Asking for the history of a user's plays, a page at a time, the newest first.
+pub trait History {
+    fn page(&self, user: &str, page: u32) -> Result<Page, Failure>;
+}
+
+impl History for Client {
+    fn page(&self, user: &str, page: u32) -> Result<Page, Failure> {
+        let page = page.to_string();
+        let text = self.get(
+            "user.getRecentTracks",
+            &[("user", user), ("page", &page), ("limit", "200")],
+        )?;
+        scrobbles::parse_recent_tracks(&text)
+    }
+}
+
+/// The plays of the first `max_pages` pages of a history (all of them, when it is shorter). When Last.fm cannot answer
+/// part-way the plays of the pages before are still returned, with why it stopped.
+pub fn fetch_history(
+    source: &dyn History,
+    user: &str,
+    max_pages: u32,
+) -> (Vec<Play>, Option<String>) {
+    let mut plays = vec![];
+    for page in 1..=max_pages {
+        match source.page(user, page) {
+            Ok(got) => {
+                plays.extend(got.plays);
+                if got.page >= got.total_pages {
+                    break;
+                }
+            }
+            Err(Failure::Unknown) => {
+                return (plays, Some("Last.fm does not know that user".into()))
+            }
+            Err(Failure::Temporary(why)) => return (plays, Some(why)),
+        }
+    }
+    (plays, None)
 }
 
 /// What has been asked so far: the artists Last.fm knows, and when it was told that it does not know one.
@@ -311,6 +355,42 @@ mod tests {
             artists_to_ask(&library, &played, Some(&baseline)),
             ["Counted", "Played", "Many Songs", "Neither"]
         );
+    }
+
+    /// Pages of a history of five plays, two a page, in the order Last.fm gives them: the newest first.
+    struct Pages {
+        fail_at: Option<u32>,
+    }
+    impl History for Pages {
+        fn page(&self, _: &str, page: u32) -> Result<Page, Failure> {
+            if self.fail_at == Some(page) {
+                return Err(Failure::Temporary("Service offline".into()));
+            }
+            let plays = (0..2)
+                .map(|i| Play::new("", &["A".to_string()], "", 1000 - (page as i64 * 2 + i)))
+                .take(if page == 3 { 1 } else { 2 })
+                .collect();
+            Ok(Page {
+                plays,
+                page,
+                total_pages: 3,
+            })
+        }
+    }
+
+    #[test]
+    fn a_history_is_read_page_by_page_to_its_end() {
+        let (plays, stopped) = fetch_history(&Pages { fail_at: None }, "u", 100);
+        assert_eq!((plays.len(), stopped), (5, None));
+        let (plays, _) = fetch_history(&Pages { fail_at: None }, "u", 2);
+        assert_eq!(plays.len(), 4, "the pages asked for and no more");
+    }
+
+    #[test]
+    fn a_history_cut_short_keeps_the_pages_before_and_says_why() {
+        let (plays, stopped) = fetch_history(&Pages { fail_at: Some(2) }, "u", 100);
+        assert_eq!(plays.len(), 2);
+        assert!(stopped.unwrap().contains("offline"));
     }
 
     /// One answer for the whole run, over a real socket, to see what is asked and how the answer is read.
