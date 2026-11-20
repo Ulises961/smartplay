@@ -238,17 +238,97 @@ fn main_artist(play: &Play) -> Option<&str> {
         .find(|a| !a.is_empty())
 }
 
-/// The main artist of each play, most recent first, each once (spellings that differ only in case, accents or a joiner
-/// count as one), at most `limit`.
-pub fn recent_artists(log: &[Play], limit: usize) -> Vec<String> {
+/// How many artists a mix starts from: the ones played most lately, then the ones played most of all.
+pub const LATELY_TOP: usize = 3;
+pub const ALL_TIME_TOP: usize = 2;
+/// "Lately" is this long, counted back from the latest play and not from the clock: a user who stopped listening a while
+/// ago still has the artists they last played. Four weeks.
+pub const LATELY: i64 = 28 * 24 * 60 * 60;
+
+/// Plays of each artist, as the artists are spelled once folded: how many, when last, and named as last spelled.
+#[derive(Default)]
+struct Counts(std::collections::HashMap<String, (usize, i64, String)>);
+
+impl Counts {
+    fn add(&mut self, artist: &str, times: usize, at: i64) {
+        let entry = self
+            .0
+            .entry(fold(artist))
+            .or_insert((0, at, artist.to_string()));
+        entry.0 += times;
+        if at >= entry.1 {
+            (entry.1, entry.2) = (at, artist.to_string());
+        }
+    }
+
+    /// The artists, most played first. Ties go to the one played last, then to the folded name, so that the order depends
+    /// on nothing but the plays.
+    fn ranked(self) -> Vec<String> {
+        let mut ranked: Vec<_> = self.0.into_iter().collect();
+        ranked.sort_by(|(ka, (na, ta, _)), (kb, (nb, tb, _))| {
+            nb.cmp(na).then(tb.cmp(ta)).then_with(|| ka.cmp(kb))
+        });
+        ranked.into_iter().map(|(_, (_, _, name))| name).collect()
+    }
+}
+
+/// The artists a user's mixes start from, in this order: the [`LATELY_TOP`] most played in the weeks before the latest
+/// play, then [`ALL_TIME_TOP`] more that were played most of all, each artist once.
+///
+/// Most played of all counts what the server counted before the engine heard of any play (the `baseline`) and the plays of
+/// `log` told after it. When fewer than [`LATELY_TOP`] artists were played lately, the artists of the albums the server
+/// lists as recent (`recent_albums`, most recent first) fill the places: they cover the time before the engine was told
+/// about plays.
+pub fn seed_artists(
+    log: &[Play],
+    baseline: Option<&Baseline>,
+    recent_albums: &[String],
+) -> Vec<String> {
+    let mut seeds: Vec<String> = vec![];
     let mut seen = HashSet::new();
-    log.iter()
-        .rev()
-        .filter_map(main_artist)
-        .filter(|a| seen.insert(fold(a)))
-        .take(limit)
-        .map(String::from)
-        .collect()
+    let mut take = |name: String, seeds: &mut Vec<String>| {
+        if seen.insert(fold(&name)) {
+            seeds.push(name);
+        }
+    };
+
+    let since = log.last().map_or(0, |p| p.at) - LATELY;
+    let mut lately = Counts::default();
+    for p in log.iter().filter(|p| p.at >= since) {
+        if let Some(artist) = main_artist(p) {
+            lately.add(artist, 1, p.at);
+        }
+    }
+    for name in lately.ranked().into_iter().take(LATELY_TOP) {
+        take(name, &mut seeds);
+    }
+    for name in recent_albums {
+        if seeds.len() < LATELY_TOP {
+            take(name.clone(), &mut seeds);
+        }
+    }
+
+    let mut all_time = Counts::default();
+    let told_after = baseline.map_or(i64::MIN, |b| b.at);
+    for tally in baseline.iter().flat_map(|b| &b.tallies) {
+        let artist = tally.artist.trim();
+        if !artist.is_empty() {
+            all_time.add(artist, tally.count as usize, 0);
+        }
+    }
+    for p in log.iter().filter(|p| p.at > told_after) {
+        if let Some(artist) = main_artist(p) {
+            all_time.add(artist, 1, p.at);
+        }
+    }
+    let before = seeds.len();
+    for name in all_time.ranked() {
+        if seeds.len() - before >= ALL_TIME_TOP {
+            break;
+        }
+        take(name, &mut seeds);
+    }
+    seeds
 }
 
 /// Plays further apart than this (their start times) are not part of one sitting. An hour allows for a long track.
@@ -461,21 +541,125 @@ mod tests {
         assert_eq!(log.len(), 2000);
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    const DAY: i64 = 24 * 3600;
+
+    /// `plays` as (artist, day) pairs, played in that order.
+    fn days(plays: &[(&str, i64)]) -> Vec<Play> {
+        plays
+            .iter()
+            .enumerate()
+            .map(|(i, (artist, day))| play(&format!("s{i}"), artist, day * DAY))
+            .collect()
+    }
+
+    fn baseline(at_day: i64, tallies: &[(&str, u32)]) -> Baseline {
+        Baseline {
+            at: at_day * DAY,
+            tallies: tallies
+                .iter()
+                .map(|(artist, count)| Tally {
+                    song: format!("{artist}-1"),
+                    artist: artist.to_string(),
+                    title: "T".into(),
+                    count: *count,
+                    last_played: None,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn recent_artists_come_newest_first_once_each() {
-        let log = [
-            play("s1", "Band A", 1),
-            play("s2", "Band B", 2),
-            play("s3", "band  a", 3),
-            play("s4", "Band C", 4),
-        ];
+    fn the_artists_played_most_in_the_last_weeks_come_first_and_ties_go_to_the_latest() {
+        let log = days(&[
+            ("A", 10),
+            ("B", 11),
+            ("B", 12),
+            ("C", 13),
+            ("D", 14),
+            ("B", 15),
+            ("A", 16),
+        ]);
+        // B three times, A twice, then C and D once each: D was played last.
+        assert_eq!(seed_artists(&log, None, &[])[..3], ["B", "A", "D"]);
+    }
+
+    #[test]
+    fn plays_older_than_the_last_weeks_count_for_all_time_and_not_for_lately() {
+        let log = days(&[
+            ("Old", 1),
+            ("Old", 2),
+            ("Old", 3),
+            ("Old", 4),
+            ("Old", 5),
+            ("New", 60),
+        ]);
+        // New is the only artist lately; Old is the most played of all.
+        assert_eq!(seed_artists(&log, None, &[]), ["New", "Old"]);
+    }
+
+    #[test]
+    fn the_most_played_of_all_follow_and_skip_the_artists_already_taken() {
+        let log = days(&[("A", 100), ("B", 101), ("C", 102)]);
+        let counted = baseline(0, &[("B", 50), ("Z", 40), ("Y", 30), ("X", 20)]);
+        // Lately: C, B, A (one play each, the latest first). B is already there, so Z and Y are the all-time two.
         assert_eq!(
-            recent_artists(&log, 10),
-            ["Band C", "band  a", "Band B"],
-            "Band A is there once, as it was last spelled"
+            seed_artists(&log, Some(&counted), &[]),
+            ["C", "B", "A", "Z", "Y"]
         );
-        assert_eq!(recent_artists(&log, 2), ["Band C", "band  a"]);
-        assert!(recent_artists(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn what_the_server_counted_adds_to_the_plays_told_after_and_not_to_those_before() {
+        let log = days(&[
+            ("Z", 1),
+            ("Z", 2),
+            ("Z", 3),
+            ("A", 100),
+            ("B", 101),
+            ("C", 102),
+        ]);
+        // The baseline was taken on day 50: the three early plays of Z are in its count of Z (1), not on top of it.
+        let counted = baseline(50, &[("Z", 1), ("Q", 2)]);
+        assert_eq!(
+            seed_artists(&log, Some(&counted), &[]),
+            ["C", "B", "A", "Q", "Z"],
+            "Q (2) is ahead of Z (1), not of Z (4)"
+        );
+    }
+
+    #[test]
+    fn without_a_baseline_the_whole_history_stands_in_for_all_time() {
+        let mut plays = vec![("Gone", 1), ("Gone", 2), ("Gone", 3), ("Gone2", 4)];
+        plays.extend([("A", 100), ("B", 101), ("C", 102)]);
+        let log = days(&plays);
+        assert_eq!(
+            seed_artists(&log, None, &[]),
+            ["C", "B", "A", "Gone", "Gone2"]
+        );
+    }
+
+    #[test]
+    fn the_recent_albums_fill_the_places_the_plays_leave() {
+        let log = days(&[("A", 100)]);
+        let albums = names(&["a", "B", "C", "D"]);
+        // "a" is A again, spelled differently.
+        assert_eq!(seed_artists(&log, None, &albums), ["A", "B", "C"]);
+        assert_eq!(seed_artists(&[], None, &albums), ["a", "B", "C"]);
+    }
+
+    #[test]
+    fn spellings_of_one_artist_count_as_one_and_are_named_as_last_spelled() {
+        let log = days(&[("Sigur Rós", 100), ("sigur ros", 101), ("B", 102)]);
+        assert_eq!(seed_artists(&log, None, &[])[..2], ["sigur ros", "B"]);
+    }
+
+    #[test]
+    fn no_plays_and_nothing_listed_means_no_seeds() {
+        assert!(seed_artists(&[], None, &[]).is_empty());
     }
 
     #[test]
@@ -504,6 +688,6 @@ mod tests {
             at: 1,
             ..Play::default()
         }];
-        assert_eq!(recent_artists(&log, 5), ["Lead"]);
+        assert_eq!(seed_artists(&log, None, &[]), ["Lead"]);
     }
 }
