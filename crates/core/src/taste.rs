@@ -28,6 +28,18 @@ pub struct Song {
     /// Mood tags of the song. Empty when the files carry none.
     #[serde(default)]
     pub moods: Vec<String>,
+    /// The year the files carry. Often the year of a reissue, not of the first release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<u16>,
+    /// How long the song is, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    /// Beats per minute, when the files carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpm: Option<u16>,
+    /// When the song was added to the library, as the server says it (an ISO 8601 date and time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
 }
 
 /// An artist weighs twice a genre: a star says more about who made the song than about its label.
