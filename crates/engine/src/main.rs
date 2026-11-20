@@ -3,6 +3,7 @@
 
 mod eval;
 mod history;
+mod lastfm;
 
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
@@ -103,6 +104,27 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let _ = fs::remove_file(part);
         Ok(())
+    }
+
+    fn lastfm_path(&self) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join("enrichment-lastfm.json")
+    }
+
+    /// What Last.fm said of artists, shared by every user (it is about artists, not about anyone); nothing when it was
+    /// never asked.
+    fn lastfm(&self) -> lastfm::Cache {
+        fs::read_to_string(self.lastfm_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_lastfm(&self, cache: &lastfm::Cache) -> Result<(), String> {
+        let path = self.lastfm_path();
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_string(cache).unwrap()).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
     fn baseline_path(&self, server: &str, user: &str) -> PathBuf {
@@ -338,9 +360,11 @@ fn main() {
         Some("import") => import_command(store, &args[1..]),
         Some("purge") => purge_command(store, &args[1..]),
         Some("eval") => eval_command(store, &args[1..]),
+        Some("enrich") => enrich_command(store, &args[1..]),
         _ => eprintln!(
             "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
+             smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
              smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
@@ -354,7 +378,15 @@ fn positional(args: &[String]) -> Vec<&str> {
     for a in args {
         if skip {
             skip = false;
-        } else if ["--data", "--bind", "--source", "--size", "--holdout-days"].contains(&a.as_str())
+        } else if [
+            "--data",
+            "--bind",
+            "--source",
+            "--size",
+            "--holdout-days",
+            "--limit",
+        ]
+        .contains(&a.as_str())
         {
             skip = true;
         } else {
@@ -398,6 +430,69 @@ fn import_command(store: Store, args: &[String]) {
         report.read - report.added,
         report.invalid.len()
     );
+}
+
+/// Asks Last.fm for the tags and close artists of the artists of a user's library, the ones heard most first, and keeps the
+/// answers for every user. It is opt-in (it needs the key in `SMARTPLAY_LASTFM_KEY`) and sends nothing but artist names. A
+/// run asks for `--limit` artists at most (100 by default) and the next run goes on from there.
+fn enrich_command(store: Store, args: &[String]) {
+    let Some(key) = std::env::var("SMARTPLAY_LASTFM_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return eprintln!(
+            "Last.fm is asked only when you give a key: set SMARTPLAY_LASTFM_KEY (the names of the artists of the library are \
+             sent to Last.fm, and nothing else)"
+        );
+    };
+    let words = positional(args);
+    let [server, user] = words.as_slice() else {
+        return eprintln!("usage: enrich SERVER USER [--limit N]");
+    };
+    let Some(library) = store.library(server, user) else {
+        return eprintln!(
+            "the engine holds no library for {user} on {server}: run the plugin once"
+        );
+    };
+    let mut left = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100usize);
+    let order = lastfm::artists_to_ask(
+        &library.songs,
+        &store.plays(server, user),
+        store.baseline(server, user).as_ref(),
+    );
+    let client = lastfm::Client::new(key.trim());
+    let mut cache = store.lastfm();
+    let mut total = lastfm::Outcome::default();
+    // In steps, saving after each, so that a run that is cut short keeps what it has.
+    while left > 0 {
+        let step = lastfm::fill(&mut cache, &order, &client, left.min(10), now() as i64);
+        if let Err(e) = store.save_lastfm(&cache) {
+            return eprintln!("what Last.fm said could not be kept: {e}");
+        }
+        left -= step.asked;
+        total.asked += step.asked;
+        total.known += step.known;
+        total.unknown += step.unknown;
+        if step.stopped.is_some() || step.asked == 0 {
+            total.stopped = step.stopped;
+            break;
+        }
+    }
+    println!(
+        "asked about {} artists: {} known, {} not known to Last.fm; {} artists have tags now",
+        total.asked,
+        total.known,
+        total.unknown,
+        cache.known.len()
+    );
+    if let Some(why) = total.stopped {
+        eprintln!("stopped: Last.fm could not answer ({why}); run it again later to go on");
+    }
 }
 
 /// Prints the mixes a user would get from the library and history the engine holds, and how well they would have predicted
