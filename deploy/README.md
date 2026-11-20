@@ -20,11 +20,13 @@ The engine runs in `debian:bookworm-slim`, whose glibc is 2.36: check that the p
 
 ```bash
 docker exec navidrome /app/navidrome --version     # plugins need a Navidrome that has them (0.64.2 is the one tried)
-ip -4 addr show docker0                              # the address the plugin will use: 172.17.0.1 unless it says otherwise
+docker inspect navidrome --format '{{range $k,$v := .NetworkSettings.Networks}}network={{$k}} ip={{$v.IPAddress}}{{end}}'
 ```
 
-If the address is not `172.17.0.1`, change it in `crates/plugin/manifest.json` (`requiredHosts`), in `compose.example.yaml`
-and in step 4, and build the plugin again.
+The engine joins the network Navidrome is on (`navidrome_default` for a stack in a folder called `navidrome`). The plugin may
+only call the hosts its manifest lists, so before building the plugin put that network's range in
+`crates/plugin/manifest.json`, under `permissions.http.requiredHosts` (for a network of `172.22.0.0/16`:
+`"requiredHosts": ["172.22.0.0/16"]`). Read the range with `docker network inspect NETWORK --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'`.
 
 ## 2. The engine
 
@@ -34,12 +36,15 @@ mkdir -p smartplay/state
 chmod 755 smartplay/smartplay-engine
 docker compose up -d smartplay-engine
 docker logs smartplay-engine          # a box with a one-time code (15 minutes); it is repeated on each start until enrolled
+docker inspect smartplay-engine --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'   # the engine's address
 ```
+
+That address can change when the stack is recreated: the plugin's setting follows it (step 4).
 
 ## 3. The plugin
 
-Add `ND_PLUGINS_ENABLED: "true"` to the `navidrome` service and `docker compose up -d navidrome` (Navidrome is off for the
-seconds this takes). Then:
+Add `ND_PLUGINS_ENABLED: "true"` to the `navidrome` service if it is not there, and `docker compose up -d navidrome`
+(Navidrome is off for the seconds this takes). Then:
 
 ```bash
 cp smartplay.ndp data/plugins/               # `data` is the folder mounted as /data
@@ -55,7 +60,7 @@ and grants nothing.
 
 ## 4. Enroll
 
-In Navidrome, the plugin's settings: engine address `http://172.17.0.1:7788` and the code from the engine's log. Within a
+In Navidrome, the plugin's settings: engine address `http://ENGINE_IP:7788` (the address above) and the code from the engine's log. Within a
 minute the plugin sends the library, and `docker logs smartplay-engine` and Navidrome's log say so. The playlists `smartplay`
 and `smartplay: mix 1`/`2` appear for the granted user once there is something to put in them.
 
