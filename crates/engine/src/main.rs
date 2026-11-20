@@ -127,6 +127,27 @@ impl Store {
         fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
+    fn recent_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("recent-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// The artists of the albums the server last listed as recent for a user, as the plugin sent them: the engine cannot ask
+    /// the server itself, so it keeps the last list to show, in `eval`, the mixes the plugin gets.
+    fn recent(&self, server: &str, user: &str) -> Vec<String> {
+        fs::read_to_string(self.recent_path(server, user))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn keep_recent(&self, server: &str, user: &str, recent: &[String]) {
+        let path = self.recent_path(server, user);
+        if self.recent(server, user) != recent {
+            let _ = fs::write(path, serde_json::to_string(recent).unwrap());
+        }
+    }
+
     fn baseline_path(&self, server: &str, user: &str) -> PathBuf {
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
         dir.join(format!("baseline-{}-{}.json", hex(server), hex(user)))
@@ -237,6 +258,7 @@ impl Store {
             format!("decisions-{}-", hex(server)),
             format!("plays-{}-", hex(server)),
             format!("baseline-{}-", hex(server)),
+            format!("recent-{}-", hex(server)),
         ]);
     }
 
@@ -248,6 +270,7 @@ impl Store {
             format!("decisions-{name}"),
             format!("plays-{name}"),
             format!("baseline-{name}"),
+            format!("recent-{name}"),
         ]);
     }
 
@@ -548,12 +571,13 @@ fn eval_command(store: Store, args: &[String]) {
     };
     let (played, baseline) = (store.plays(server, user), store.baseline(server, user));
     let (decisions, cache) = (store.decisions(server, user), store.lastfm());
+    let recent = store.recent(server, user);
     let report = eval::evaluate(
         &eval::Input {
             library: &library.songs,
             played: &played,
             baseline: baseline.as_ref(),
-            recent: &[],
+            recent: &recent,
             decisions: &decisions,
             enrichment: &cache.known,
         },
@@ -781,6 +805,7 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
             let Ok(req) = serde_json::from_str::<ComputeRequest>(body) else {
                 return (400, "bad request".into());
             };
+            store.keep_recent(&server.name, &req.user, &req.recent);
             let answer = match store.library(&server.name, &req.user) {
                 Some(copy) if copy.fingerprint == req.fingerprint => {
                     let decisions = store.decisions(&server.name, &req.user);
@@ -1136,6 +1161,20 @@ mod tests {
             mix_songs(compute(&store, "1@x")),
             vec![vec!["p1".to_string(), "m1".to_string()]]
         );
+    }
+
+    #[test]
+    fn the_artists_of_the_recent_albums_the_plugin_sent_are_kept_for_eval_and_purged_with_the_user()
+    {
+        let store = paired("recent-kept");
+        upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
+        compute_recent(&store, "1@x", &["Queen", "ABBA"]);
+        assert_eq!(store.recent("home", "ana"), ["Queen", "ABBA"]);
+        compute_recent(&store, "1@x", &[]);
+        assert!(store.recent("home", "ana").is_empty());
+        compute_recent(&store, "1@x", &["Queen"]);
+        store.forget_user("home", "ana");
+        assert!(store.recent("home", "ana").is_empty());
     }
 
     #[test]
