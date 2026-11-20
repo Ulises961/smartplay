@@ -561,6 +561,7 @@ mod tests {
             song: format!("{artist}-heard"),
             artists: vec![artist.into()],
             at,
+            ..Play::default()
         }
     }
 
