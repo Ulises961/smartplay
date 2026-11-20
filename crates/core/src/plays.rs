@@ -132,6 +132,77 @@ pub fn record(log: &mut Vec<Play>, play: Play) -> bool {
     true
 }
 
+/// Adds to `log` (in time order, as [`record`] keeps it) the plays of `new` that are not in it yet, each one looking only at
+/// the plays near it in time, so that a long history can take a long import. Returns the plays added, in the order given.
+pub fn merge_new(log: &mut Vec<Play>, new: Vec<Play>) -> Vec<Play> {
+    let mut added = vec![];
+    for play in new {
+        let from = log.partition_point(|p| p.at < play.at - DUPLICATE_WINDOW);
+        let near = log[from..]
+            .iter()
+            .take_while(|p| p.at <= play.at + DUPLICATE_WINDOW);
+        if near.clone().any(|p| same_play(p, &play)) {
+            continue;
+        }
+        let at = log.partition_point(|p| p.at <= play.at);
+        log.insert(at, play.clone());
+        added.push(play);
+    }
+    added
+}
+
+/// One play of a file to import, as a line of JSON. The fields are those of [`Play`], with `artist` (one name) as a
+/// shorthand for `artists`. `at` is in seconds since the epoch, and `listened_ms` and `track_ms` in milliseconds.
+#[derive(Deserialize)]
+struct ImportLine {
+    at: i64,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    artists: Vec<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    album: String,
+    #[serde(default)]
+    song: String,
+    #[serde(default)]
+    listened_ms: Option<u64>,
+    #[serde(default)]
+    track_ms: Option<u64>,
+    #[serde(default)]
+    ended: Option<Ended>,
+}
+
+/// The play a line of an import file tells of, marked as coming from `import:<source>`.
+pub fn from_import_line(line: &str, source: &str) -> Result<Play, String> {
+    let l: ImportLine = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    // Milliseconds in the place of seconds is the usual mistake, and it would put every play thousands of years ahead.
+    if !(0..4_102_444_800).contains(&l.at) {
+        return Err(format!(
+            "`at` is {}: seconds since the epoch are meant",
+            l.at
+        ));
+    }
+    let artists = if l.artists.is_empty() {
+        vec![l.artist]
+    } else {
+        l.artists
+    };
+    let mut play = Play::new(&l.song, &artists, "", l.at);
+    play.title = l.title;
+    play.album = l.album;
+    play.listened_ms = l.listened_ms;
+    play.track_ms = l.track_ms;
+    play.ended = l.ended;
+    play.source = format!("import:{source}");
+    if play.is_usable() {
+        Ok(play)
+    } else {
+        Err("a play names a song (an id or a title) and an artist".into())
+    }
+}
+
 /// Drops the plays older than `retention` seconds before `now`.
 pub fn prune(log: &mut Vec<Play>, now: i64, retention: i64) {
     log.retain(|p| p.at >= now - retention);
@@ -295,6 +366,53 @@ mod tests {
             log.iter().map(|p| p.song.as_str()).collect::<Vec<_>>(),
             ["s1", "s2"]
         );
+    }
+
+    #[test]
+    fn merging_adds_what_is_new_and_a_second_merge_adds_nothing() {
+        let mut log = vec![play("s1", "A", 100), play("s3", "A", 300)];
+        let new = vec![
+            play("s3", "A", 302),         // told twice
+            elsewhere("B", "Song", 200),  // between the two
+            elsewhere("b", "song", 205),  // the same play, told by a second source
+            elsewhere("B", "Song", 5000), // the same song, much later
+        ];
+        let added = merge_new(&mut log, new.clone());
+        assert_eq!(added.len(), 2);
+        assert_eq!(
+            log.iter().map(|p| p.at).collect::<Vec<_>>(),
+            [100, 200, 300, 5000],
+            "the history stays in time order"
+        );
+        assert!(merge_new(&mut log, new).is_empty());
+    }
+
+    #[test]
+    fn a_line_of_an_import_file_becomes_a_play_marked_with_its_source() {
+        let play = from_import_line(
+            r#"{"at":1700000000,"artist":"Portishead","title":"Glory Box","album":"Dummy",
+                "listened_ms":10000,"track_ms":300000}"#,
+            "spotify",
+        )
+        .unwrap();
+        assert_eq!(play.artists, ["Portishead"]);
+        assert_eq!(play.source, "import:spotify");
+        assert_eq!(play.ended(), Some(Ended::Skip));
+        let listed = from_import_line(r#"{"at":5,"artists":["A","B"],"song":"s1"}"#, "x").unwrap();
+        assert_eq!(listed.artists, ["A", "B"]);
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_play_says_why() {
+        for line in [
+            "not json",
+            r#"{"artist":"A","title":"T"}"#,
+            r#"{"at":1700000000000,"artist":"A","title":"T"}"#,
+            r#"{"at":5,"artist":"A"}"#,
+            r#"{"at":5,"title":"T"}"#,
+        ] {
+            assert!(from_import_line(line, "x").is_err(), "{line}");
+        }
     }
 
     #[test]
