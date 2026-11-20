@@ -1,6 +1,7 @@
 //! Engine: registered servers, one-time enrollment codes, bearer tokens. Answers each granted user with a playlist.
 //! State is a JSON file so the `servers` commands (separate processes) and `serve` share it.
 
+mod eval;
 mod history;
 
 use serde::{Deserialize, Serialize};
@@ -336,9 +337,11 @@ fn main() {
         Some("artists") => artists_command(store, &args[1..]),
         Some("import") => import_command(store, &args[1..]),
         Some("purge") => purge_command(store, &args[1..]),
+        Some("eval") => eval_command(store, &args[1..]),
         _ => eprintln!(
             "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
@@ -351,7 +354,8 @@ fn positional(args: &[String]) -> Vec<&str> {
     for a in args {
         if skip {
             skip = false;
-        } else if a == "--data" || a == "--bind" || a == "--source" {
+        } else if ["--data", "--bind", "--source", "--size", "--holdout-days"].contains(&a.as_str())
+        {
             skip = true;
         } else {
             words.push(a.as_str());
@@ -394,6 +398,37 @@ fn import_command(store: Store, args: &[String]) {
         report.read - report.added,
         report.invalid.len()
     );
+}
+
+/// Prints the mixes a user would get from the library and history the engine holds, and how well they would have predicted
+/// the last days of it (see `eval.rs`). Nothing is changed.
+fn eval_command(store: Store, args: &[String]) {
+    let number = |flag: &str, default: i64| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let words = positional(args);
+    let [server, user] = words.as_slice() else {
+        return eprintln!("usage: eval SERVER USER [--size N] [--holdout-days N]");
+    };
+    let Some(library) = store.library(server, user) else {
+        return eprintln!(
+            "the engine holds no library for {user} on {server}: run the plugin once"
+        );
+    };
+    let report = eval::evaluate(
+        &library.songs,
+        &store.plays(server, user),
+        store.baseline(server, user).as_ref(),
+        &[],
+        &store.decisions(server, user),
+        number("--size", MIX_SIZE as i64) as usize,
+        number("--holdout-days", 14),
+    );
+    print!("{}", report.render());
 }
 
 /// Deletes everything held about one user of a server: the library copy, the artist decisions and the history of plays.
