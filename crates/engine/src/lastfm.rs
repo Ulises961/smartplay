@@ -27,6 +27,14 @@ const GAP: Duration = Duration::from_millis(350);
 /// An artist Last.fm did not know is asked about again after this long: ninety days.
 const UNKNOWN_FOR: i64 = 90 * 24 * 60 * 60;
 
+/// An artist whose answer could not be had is left for this long and then asked again: not an absence, only a pause, so that
+/// one name that Last.fm cannot answer does not hold up the rest.
+const RETRY_FAILED_AFTER: i64 = 6 * 60 * 60;
+
+/// A request that could not be answered is tried again this many times, waiting a little longer each time.
+const RETRIES: u32 = 2;
+const RETRY_WAIT: Duration = Duration::from_secs(2);
+
 /// Asking about one artist.
 pub trait Lookup {
     fn info(&self, artist: &str) -> Result<ArtistInfo, Failure>;
@@ -37,16 +45,17 @@ pub struct Client {
     key: String,
     base: String,
     gap: Duration,
+    retry_wait: Duration,
     agent: ureq::Agent,
     last: std::cell::Cell<Option<Instant>>,
 }
 
 impl Client {
     pub fn new(key: &str) -> Client {
-        Client::with(key, API, GAP)
+        Client::with(key, API, GAP, RETRY_WAIT)
     }
 
-    fn with(key: &str, base: &str, gap: Duration) -> Client {
+    fn with(key: &str, base: &str, gap: Duration, retry_wait: Duration) -> Client {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             // Last.fm tells why it refuses in the body of a 4xx or 5xx: the body is what is read, not the status.
             .http_status_as_error(false)
@@ -58,9 +67,23 @@ impl Client {
             key: key.into(),
             base: base.into(),
             gap,
+            retry_wait,
             agent,
             last: std::cell::Cell::new(None),
         }
+    }
+
+    /// `ask` again, a little later, while the answer is "could not answer": a service that hiccups answers the next time.
+    fn retrying<T>(&self, ask: impl Fn() -> Result<T, Failure>) -> Result<T, Failure> {
+        let mut result = ask();
+        for attempt in 1..=RETRIES {
+            if !matches!(result, Err(Failure::Temporary(_))) {
+                break;
+            }
+            std::thread::sleep(self.retry_wait * attempt);
+            result = ask();
+        }
+        result
     }
 
     fn get(&self, method: &str, params: &[(&str, &str)]) -> Result<String, Failure> {
@@ -92,8 +115,10 @@ impl Client {
 impl Lookup for Client {
     fn info(&self, artist: &str) -> Result<ArtistInfo, Failure> {
         let about = [("artist", artist), ("autocorrect", "1"), ("limit", "30")];
-        let tags = enrich::parse_top_tags(&self.get("artist.getTopTags", &about)?)?;
-        let similar = enrich::parse_similar(&self.get("artist.getSimilar", &about)?)?;
+        let tags =
+            self.retrying(|| enrich::parse_top_tags(&self.get("artist.getTopTags", &about)?))?;
+        let similar =
+            self.retrying(|| enrich::parse_similar(&self.get("artist.getSimilar", &about)?))?;
         Ok(ArtistInfo { tags, similar })
     }
 }
@@ -106,11 +131,13 @@ pub trait History {
 impl History for Client {
     fn page(&self, user: &str, page: u32) -> Result<Page, Failure> {
         let page = page.to_string();
-        let text = self.get(
-            "user.getRecentTracks",
-            &[("user", user), ("page", &page), ("limit", "200")],
-        )?;
-        scrobbles::parse_recent_tracks(&text)
+        self.retrying(|| {
+            let text = self.get(
+                "user.getRecentTracks",
+                &[("user", user), ("page", &page), ("limit", "200")],
+            )?;
+            scrobbles::parse_recent_tracks(&text)
+        })
     }
 }
 
@@ -145,6 +172,9 @@ pub struct Cache {
     pub known: Enrichment,
     /// Folded names, and when the answer "not known" came, in seconds since the epoch.
     pub unknown: HashMap<String, i64>,
+    /// Folded names, and when the answer could not be had: they are left alone for a few hours.
+    #[serde(default)]
+    pub failed: HashMap<String, i64>,
 }
 
 impl Cache {
@@ -154,6 +184,10 @@ impl Cache {
                 .unknown
                 .get(&fold(artist))
                 .is_none_or(|&at| now - at > UNKNOWN_FOR)
+            && self
+                .failed
+                .get(&fold(artist))
+                .is_none_or(|&at| now - at > RETRY_FAILED_AFTER)
     }
 }
 
@@ -163,12 +197,15 @@ pub struct Outcome {
     pub asked: usize,
     pub known: usize,
     pub unknown: usize,
+    /// Artists whose answer could not be had, left for later while the run went on.
+    pub skipped: usize,
     /// Why the run stopped before its end, when it did.
     pub stopped: Option<String>,
 }
 
 /// Asks about the artists in `order` that the cache does not hold, at most `limit` of them, and keeps what comes back in
-/// `cache`. A temporary failure ends the run at once.
+/// `cache`. An artist whose answer could not be had is left for later and the run goes on; two in a row mean the service
+/// is not answering, and the run ends.
 pub fn fill(
     cache: &mut Cache,
     order: &[String],
@@ -177,6 +214,7 @@ pub fn fill(
     now: i64,
 ) -> Outcome {
     let mut outcome = Outcome::default();
+    let mut in_a_row = 0;
     for artist in order {
         if outcome.asked >= limit {
             break;
@@ -187,16 +225,24 @@ pub fn fill(
         match lookup.info(artist) {
             Ok(info) => {
                 cache.unknown.remove(&fold(artist));
+                cache.failed.remove(&fold(artist));
                 cache.known.insert(artist, info);
                 outcome.known += 1;
+                in_a_row = 0;
             }
             Err(Failure::Unknown) => {
                 cache.unknown.insert(fold(artist), now);
                 outcome.unknown += 1;
+                in_a_row = 0;
             }
             Err(Failure::Temporary(why)) => {
-                outcome.stopped = Some(why);
-                break;
+                cache.failed.insert(fold(artist), now);
+                outcome.skipped += 1;
+                in_a_row += 1;
+                if in_a_row >= 2 {
+                    outcome.stopped = Some(why);
+                    break;
+                }
             }
         }
         outcome.asked += 1;
@@ -308,16 +354,38 @@ mod tests {
     }
 
     #[test]
-    fn a_service_that_cannot_answer_ends_the_run_and_nothing_is_kept_for_that_artist() {
+    fn one_artist_that_cannot_be_answered_is_left_for_later_and_the_run_goes_on() {
         let mut cache = Cache::default();
         let fake = Fake(RefCell::new(vec![]));
         let order = names(&["A", "Busy", "C"]);
         let run = fill(&mut cache, &order, &fake, 10, 1000);
-        assert_eq!((run.asked, run.known), (1, 1));
-        assert!(run.stopped.unwrap().contains("Rate limit"));
-        assert_eq!(*fake.0.borrow(), ["A", "Busy"], "C was not asked");
+        assert_eq!((run.known, run.skipped, run.stopped), (2, 1, None));
+        assert!(cache.known.get("C").is_some(), "C was asked after it");
         assert!(cache.known.get("Busy").is_none());
         assert!(cache.unknown.is_empty(), "a failure is not an absence");
+        // Not asked again at once, but asked again after a few hours.
+        assert_eq!(fill(&mut cache, &order, &fake, 10, 1001).asked, 0);
+        let later = fill(&mut cache, &order, &fake, 10, 1000 + RETRY_FAILED_AFTER + 1);
+        assert_eq!((later.asked, later.skipped), (1, 1));
+    }
+
+    #[test]
+    fn two_in_a_row_mean_the_service_is_not_answering_and_end_the_run() {
+        let mut cache = Cache::default();
+        let order = names(&["A", "Busy", "Busy2", "C"]);
+        struct Down;
+        impl Lookup for Down {
+            fn info(&self, artist: &str) -> Result<ArtistInfo, Failure> {
+                match artist {
+                    "A" | "C" => Ok(ArtistInfo::default()),
+                    _ => Err(Failure::Temporary("Service offline".into())),
+                }
+            }
+        }
+        let run = fill(&mut cache, &order, &Down, 10, 1000);
+        assert_eq!((run.known, run.skipped), (1, 2));
+        assert!(run.stopped.unwrap().contains("offline"));
+        assert!(cache.known.get("C").is_none(), "C was not asked");
     }
 
     #[test]
@@ -422,7 +490,7 @@ mod tests {
                 r#"{"similarartists":{"artist":[{"name":"Massive Attack","match":"0.8"}]}}"#,
             ),
         ]);
-        let client = Client::with("the-key", &base, Duration::ZERO);
+        let client = Client::with("the-key", &base, Duration::ZERO, Duration::ZERO);
         let info = client.info("Portishead").unwrap();
         assert_eq!(info.tags, [("trip hop".to_string(), 1.0)]);
         assert_eq!(info.similar[0].0, "Massive Attack");
@@ -439,12 +507,25 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_is_not_json_is_asked_again_and_the_next_one_is_used() {
+        let (base, handle) = serve(vec![
+            (502, "<html>Bad gateway</html>"),
+            (200, r#"{"toptags":{"tag":[{"count":100,"name":"rock"}]}}"#),
+            (200, r#"{"similarartists":{"artist":[]}}"#),
+        ]);
+        let client = Client::with("k", &base, Duration::ZERO, Duration::ZERO);
+        let info = client.info("Anyone").unwrap();
+        assert_eq!(info.tags, [("rock".to_string(), 1.0)]);
+        assert_eq!(handle.join().unwrap().len(), 3);
+    }
+
+    #[test]
     fn the_reason_in_the_body_of_an_error_status_is_what_counts() {
         let (base, handle) = serve(vec![(
             404,
             r#"{"error":6,"message":"The artist you supplied could not be found"}"#,
         )]);
-        let client = Client::with("k", &base, Duration::ZERO);
+        let client = Client::with("k", &base, Duration::ZERO, Duration::ZERO);
         assert_eq!(client.info("Nobody"), Err(Failure::Unknown));
         handle.join().unwrap();
     }

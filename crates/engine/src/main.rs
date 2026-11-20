@@ -471,16 +471,18 @@ fn enrich_command(store: Store, args: &[String]) {
         total.asked += step.asked;
         total.known += step.known;
         total.unknown += step.unknown;
+        total.skipped += step.skipped;
         if step.stopped.is_some() || step.asked == 0 {
             total.stopped = step.stopped;
             break;
         }
     }
     println!(
-        "asked about {} artists: {} known, {} not known to Last.fm; {} artists have tags now",
+        "asked about {} artists: {} known, {} not known to Last.fm, {} left for later; {} artists have tags now",
         total.asked,
         total.known,
         total.unknown,
+        total.skipped,
         cache.known.len()
     );
     if let Some(why) = total.stopped {
