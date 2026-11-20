@@ -10,6 +10,7 @@ pub mod normalize;
 pub mod playlist;
 pub mod plays;
 pub mod protocol;
+pub mod scrobbles;
 pub mod taste;
 
 /// A way to call a Subsonic-compatible server. `request` is the endpoint with its query,
