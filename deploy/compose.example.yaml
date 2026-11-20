@@ -1,8 +1,8 @@
 # The engine as one more service of a Navidrome compose stack. Add it beside the `navidrome` service, in the same file.
 #
-# The plugin runs inside Navidrome and reaches the engine on the address of the host's docker bridge (172.17.0.1 unless
-# `ip -4 addr show docker0` says otherwise; the plugin's manifest lists that address in `requiredHosts`). The engine is
-# published on that address only, so it is not reachable from the network.
+# It joins the stack's own network and publishes no port, so nothing outside the stack can reach it. The plugin runs inside
+# Navidrome and reaches the engine by the engine's address on that network: the plugin's manifest must list the network's
+# range in `requiredHosts` (see README.md).
 services:
   smartplay-engine:
     image: debian:bookworm-slim
@@ -11,8 +11,6 @@ services:
     # The user that owns the folder of the engine's state (see README.md).
     user: "1000:1000"
     command: ["/opt/smartplay-engine", "serve", "--bind", "0.0.0.0:7788", "--data", "/state"]
-    ports:
-      - "172.17.0.1:7788:7788"
     volumes:
       - "./smartplay/smartplay-engine:/opt/smartplay-engine:ro"
       - "./smartplay/state:/state"
