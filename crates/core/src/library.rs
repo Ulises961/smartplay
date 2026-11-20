@@ -110,6 +110,10 @@ struct Raw {
     bpm: Option<u32>,
     #[serde(default)]
     created: Option<String>,
+    #[serde(default, rename = "playCount", deserialize_with = "number")]
+    play_count: Option<u32>,
+    #[serde(default)]
+    played: Option<String>,
 }
 
 /// A number the server gives as a number or as text; anything else, or a zero, is no number. One odd value must not
@@ -234,6 +238,8 @@ pub fn songs(api: &dyn Subsonic, user: &str, offset: usize) -> Result<Vec<Song>,
             duration: s.duration,
             bpm: s.bpm.and_then(|b| u16::try_from(b).ok()),
             created: s.created.filter(|c| !c.trim().is_empty()),
+            play_count: s.play_count,
+            last_played: s.played.filter(|c| !c.trim().is_empty()),
         })
         .collect())
 }
@@ -377,7 +383,8 @@ mod tests {
             fn call(&self, _: &str) -> Result<String, String> {
                 Ok(
                     r#"{"subsonic-response":{"status":"ok","searchResult3":{"song":[
-                    {"id":"a","year":1994,"duration":215,"bpm":120,"created":"2026-10-30T10:00:00Z"},
+                    {"id":"a","year":1994,"duration":215,"bpm":120,"created":"2026-10-30T10:00:00Z",
+                     "playCount":3,"played":"2026-11-20T08:33:59.586723049Z"},
                     {"id":"b","year":"1994","duration":0,"bpm":"fast","created":" "},
                     {"id":"c","year":-3,"duration":1e12,"bpm":null}]}}}"#
                         .into(),
@@ -390,6 +397,15 @@ mod tests {
             (Some(1994), Some(215), Some(120))
         );
         assert_eq!(found[0].created.as_deref(), Some("2026-10-30T10:00:00Z"));
+        assert_eq!(found[0].play_count, Some(3));
+        assert_eq!(
+            found[0].last_played.as_deref(),
+            Some("2026-11-20T08:33:59.586723049Z")
+        );
+        assert_eq!(
+            found[1].play_count, None,
+            "a song never played has no count"
+        );
         assert_eq!(
             (
                 found[1].year,

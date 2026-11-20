@@ -40,6 +40,13 @@ pub struct Song {
     /// When the song was added to the library, as the server says it (an ISO 8601 date and time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
+    /// How many times the server counts the song as played, and when it last was (an ISO 8601 date and time). These
+    /// change with every play and are not part of what makes a library "changed": only the first copy of a library the
+    /// engine receives is read for them (see `plays::Baseline`), and they are not kept in the copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<String>,
 }
 
 /// An artist weighs twice a genre: a star says more about who made the song than about its label.

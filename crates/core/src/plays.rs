@@ -208,6 +208,28 @@ pub fn prune(log: &mut Vec<Play>, now: i64, retention: i64) {
     log.retain(|p| p.at >= now - retention);
 }
 
+/// What the server counted before the engine heard of any play: how many times each song was played. Taken once, from the
+/// first copy of a user's library the engine receives; plays told after that are in the history as events. It has no
+/// times, no sittings and no skips, so it can only say what was played most of all.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Baseline {
+    /// When it was taken, in seconds since the epoch.
+    pub at: i64,
+    pub tallies: Vec<Tally>,
+}
+
+/// One song of a [`Baseline`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Tally {
+    pub song: String,
+    pub artist: String,
+    pub title: String,
+    pub count: u32,
+    /// When the server says it was last played, as it writes it (an ISO 8601 date and time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<String>,
+}
+
 /// The main artist of a play: the first one credited.
 fn main_artist(play: &Play) -> Option<&str> {
     play.artists
