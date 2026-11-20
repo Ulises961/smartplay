@@ -90,11 +90,12 @@ impl Store {
         if !chunk.last {
             return Ok(());
         }
-        let songs: Vec<taste::Song> = fs::read_to_string(&part)
+        let mut songs: Vec<taste::Song> = fs::read_to_string(&part)
             .map_err(|e| e.to_string())?
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
+        self.take_baseline(server, &chunk.user, &mut songs)?;
         let stored = StoredLibrary {
             fingerprint: chunk.fingerprint,
             songs,
@@ -104,6 +105,57 @@ impl Store {
         fs::rename(&done, self.library_path(server, &chunk.user, "json"))
             .map_err(|e| e.to_string())?;
         let _ = fs::remove_file(part);
+        Ok(())
+    }
+
+    fn baseline_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("baseline-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// What the server counted as played before the engine heard of any play; none when it was never taken.
+    // Read by the seeds of the mixes, which come next.
+    #[allow(dead_code)]
+    fn baseline(&self, server: &str, user: &str) -> Option<plays::Baseline> {
+        let text = fs::read_to_string(self.baseline_path(server, user)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Keeps the play counts of the first copy of a user's library as their baseline, once, and takes the counts out of
+    /// `songs`: they change with every play, and the history is where plays are kept from then on.
+    fn take_baseline(
+        &self,
+        server: &str,
+        user: &str,
+        songs: &mut [taste::Song],
+    ) -> Result<(), String> {
+        let path = self.baseline_path(server, user);
+        if !path.exists() {
+            let tallies: Vec<plays::Tally> = songs
+                .iter()
+                .filter_map(|s| {
+                    Some(plays::Tally {
+                        song: s.id.clone(),
+                        artist: s.artist.clone(),
+                        title: s.title.clone(),
+                        count: s.play_count.filter(|&c| c > 0)?,
+                        last_played: s.last_played.clone(),
+                    })
+                })
+                .collect();
+            let baseline = plays::Baseline {
+                at: now() as i64,
+                tallies,
+            };
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, serde_json::to_string(&baseline).unwrap())
+                .map_err(|e| e.to_string())?;
+            fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        }
+        for song in songs {
+            song.play_count = None;
+            song.last_played = None;
+        }
         Ok(())
     }
 
@@ -167,6 +219,7 @@ impl Store {
             format!("library-{}-", hex(server)),
             format!("decisions-{}-", hex(server)),
             format!("plays-{}-", hex(server)),
+            format!("baseline-{}-", hex(server)),
         ]);
     }
 
@@ -177,6 +230,7 @@ impl Store {
             format!("library-{name}"),
             format!("decisions-{name}"),
             format!("plays-{name}"),
+            format!("baseline-{name}"),
         ]);
     }
 
@@ -862,6 +916,37 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[1].source, "import:spotify");
         assert_eq!(kept[1].ended(), Some(plays::Ended::Skip));
+    }
+
+    #[test]
+    fn the_first_library_copy_gives_a_baseline_of_play_counts_and_later_ones_do_not_change_it() {
+        let store = paired("baseline");
+        let counted = |id: &str, count: Option<u32>| taste::Song {
+            play_count: count,
+            last_played: count.map(|_| "2026-11-20T08:33:59Z".to_string()),
+            ..song(id, "Queen")
+        };
+        upload(
+            &store,
+            "1@x",
+            &[vec![counted("a1", Some(7)), counted("a2", None)]],
+        );
+        let baseline = store.baseline("home", "ana").unwrap();
+        assert_eq!(baseline.tallies.len(), 1, "an unplayed song is no tally");
+        assert_eq!(
+            (baseline.tallies[0].song.as_str(), baseline.tallies[0].count),
+            ("a1", 7)
+        );
+        assert!(
+            store.library("home", "ana").unwrap().songs[0]
+                .play_count
+                .is_none(),
+            "the copy the mixes read holds no counts"
+        );
+        upload(&store, "2@y", &[vec![counted("a1", Some(9))]]);
+        assert_eq!(store.baseline("home", "ana").unwrap().tallies[0].count, 7);
+        store.forget_user("home", "ana");
+        assert!(store.baseline("home", "ana").is_none());
     }
 
     #[test]
