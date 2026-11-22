@@ -11,7 +11,7 @@ use std::fmt::Write;
 use smartplay_core::{
     enrich::Enrichment,
     identity::Decisions,
-    mix,
+    mix::{self, Tuning},
     normalize::fold,
     plays::{self, Baseline, Ended, Play},
     taste::Song,
@@ -126,6 +126,7 @@ pub struct Input<'a> {
     pub recent: &'a [String],
     pub decisions: &'a Decisions,
     pub enrichment: &'a Enrichment,
+    pub tuning: Tuning,
 }
 
 /// The mixes for `input`, and the check against the last `holdout_days` of its history.
@@ -137,6 +138,7 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
         recent,
         decisions,
         enrichment,
+        tuning,
     } = *input;
     let index = Index::new(library);
     let name_of: HashMap<&str, String> = library
@@ -145,7 +147,13 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
         .collect();
 
     let seeds = plays::seed_artists(played, baseline, recent);
-    let mixes = mix::recent_artist_mixes(library, &seeds, played, decisions, enrichment, size);
+    let explained = mix::recent_artist_mixes_explained(
+        library, &seeds, played, decisions, enrichment, size, &tuning,
+    );
+    let mixes: Vec<Vec<String>> = explained
+        .iter()
+        .map(|m| m.iter().map(|c| c.id.clone()).collect())
+        .collect();
 
     let in_mixes: HashSet<&str> = mixes.iter().flatten().map(String::as_str).collect();
     let mut per_artist: HashMap<String, usize> = HashMap::new();
@@ -193,11 +201,15 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
                 }
             })
             .collect(),
-        mixes: mixes
+        mixes: explained
             .iter()
             .map(|m| {
                 m.iter()
-                    .map(|id| name_of.get(id.as_str()).cloned().unwrap_or(id.clone()))
+                    .map(|c| {
+                        let name = name_of.get(c.id.as_str()).cloned();
+                        let name = name.unwrap_or(c.id.clone());
+                        format!("{name}   [{}]", why(c))
+                    })
                     .collect()
             })
             .collect(),
@@ -231,7 +243,19 @@ fn holdout(input: &Input, enrichment: &Enrichment, size: usize, days: i64) -> Op
         return None;
     }
     let seeds = plays::seed_artists(before, baseline, &[]);
-    let mixes = mix::recent_artist_mixes(library, &seeds, before, decisions, enrichment, size);
+    let mixes = mix::recent_artist_mixes_explained(
+        library,
+        &seeds,
+        before,
+        decisions,
+        enrichment,
+        size,
+        &input.tuning,
+    );
+    let mixes: Vec<Vec<String>> = mixes
+        .into_iter()
+        .map(|m| m.into_iter().map(|c| c.id).collect())
+        .collect();
     let songs: HashSet<&str> = mixes.iter().flatten().map(String::as_str).collect();
     let artists: HashSet<String> = songs
         .iter()
@@ -257,6 +281,21 @@ fn holdout(input: &Input, enrichment: &Enrichment, size: usize, days: i64) -> Op
         song_chance: ratio(songs.len(), library.len()),
         artist_chance: ratio(artists.len(), artist_count),
     })
+}
+
+/// The reason a song is in a mix, for its line: an artist played lately, or the parts of a similar song's score.
+fn why(song: &mix::Chosen) -> String {
+    if song.base {
+        "played lately".to_string()
+    } else {
+        format!(
+            "tags {:.2} + heard with {:.2} + close {:.2} x 0.5 = {:.2}",
+            song.tags,
+            song.together,
+            song.close,
+            song.tags + song.together + 0.5 * song.close
+        )
+    }
 }
 
 fn ratio(part: usize, whole: usize) -> f64 {
@@ -400,6 +439,7 @@ mod tests {
                 recent: &[],
                 decisions: &Decisions::default(),
                 enrichment: &Enrichment::default(),
+                tuning: Tuning::default(),
             },
             10,
             14,
