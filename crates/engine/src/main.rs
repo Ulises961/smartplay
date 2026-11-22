@@ -390,7 +390,7 @@ fn main() {
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
              smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
              smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
-             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
@@ -570,7 +570,7 @@ fn eval_command(store: Store, args: &[String]) {
     let words = positional(args);
     let [server, user] = words.as_slice() else {
         return eprintln!(
-            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X] [--max-mixes N]"
+            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N]"
         );
     };
     let tuning = {
@@ -578,6 +578,7 @@ fn eval_command(store: Store, args: &[String]) {
         smartplay_core::mix::Tuning {
             min_aligned: share("--min-aligned", base.min_aligned),
             min_fit: share("--min-fit", base.min_fit),
+            min_content: share("--min-content", base.min_content),
             max_artist_share: share("--max-share", base.max_artist_share),
             max_mixes: number("--max-mixes", base.max_mixes as i64).max(1) as usize,
         }

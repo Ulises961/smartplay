@@ -29,6 +29,11 @@ pub struct Tuning {
     pub min_aligned: f64,
     /// A similar song must score at least this to be in a mix: a mix is left short rather than filled with weak matches.
     pub min_fit: f64,
+    /// A similar song whose own tags or whose artist's closeness to the base are known must also have at least this much
+    /// from them (the tags' cosine plus half the closeness), whatever the sittings add: what was heard in the same sittings
+    /// says nothing of style, so it cannot make up for a song that does not sound like the mix. A song with nothing known
+    /// of it but the sittings is judged by the sittings alone.
+    pub min_content: f64,
     /// The share of a mix one artist may take while others can still fill it; it is lifted only to fill what is left.
     pub max_artist_share: f64,
     /// At most this many mixes are made; the groups with the most recent artists come first.
@@ -40,6 +45,7 @@ impl Default for Tuning {
         Tuning {
             min_aligned: 0.4,
             min_fit: 0.5,
+            min_content: 0.45,
             max_artist_share: 0.2,
             max_mixes: 3,
         }
@@ -190,7 +196,10 @@ pub fn recent_artist_mixes_explained(
                     let heard = a.and_then(|a| together.get(&a)).copied().unwrap_or(0.0);
                     let named = a.and_then(|a| close.get(&a)).copied().unwrap_or(0.0);
                     let score = by_tags + CO_LISTENING_WEIGHT * heard + SIMILAR_WEIGHT * named;
-                    if score >= tuning.min_fit {
+                    let content = by_tags + SIMILAR_WEIGHT * named;
+                    let content_known = !song_tags.is_empty() || named > 0.0;
+                    if score >= tuning.min_fit && (!content_known || content >= tuning.min_content)
+                    {
                         similar.push(Candidate {
                             chosen: Chosen {
                                 id: song.id.clone(),
@@ -736,6 +745,7 @@ mod tests {
         // The order is what is tried, so the floor for a similar song is lowered to let the plain rock ones in.
         let tuning = Tuning {
             min_fit: 0.1,
+            min_content: 0.0,
             ..Tuning::default()
         };
         let mix: Vec<String> = recent_artist_mixes_explained(
@@ -984,16 +994,16 @@ mod tests {
 
     #[test]
     fn an_artist_heard_in_the_same_sittings_leads_the_similar_songs_even_without_tags() {
-        // Neither candidate shares a tag with Band A, so tags alone choose nothing; the one heard beside it is chosen.
+        // Neither candidate has a tag, so tags alone choose nothing; the one heard beside Band A is chosen.
         let library = vec![
             song("a1", "Band A", &["Rock"], &[]),
-            song("n1", "Neighbour", &["Jazz"], &[]),
-            song("s1", "Stranger", &["Folk"], &[]),
+            song("n1", "Neighbour", &[], &[]),
+            song("s1", "Stranger", &[], &[]),
         ];
         assert_eq!(
             mixes(&library, &["Band A"], 5)[0],
             ["a1"],
-            "no tags in common"
+            "nothing to go by"
         );
         let played = [
             heard("Band A", 0),
@@ -1063,7 +1073,7 @@ mod tests {
         // Both candidates are heard once beside Band A; the one that also shares a tag comes first.
         let library = vec![
             song("a1", "Band A", &["Rock"], &[]),
-            song("n1", "Neighbour", &["Jazz"], &[]),
+            song("n1", "Neighbour", &[], &[]),
             song("t1", "Tagged", &["Rock"], &[]),
         ];
         let played = [
@@ -1074,6 +1084,25 @@ mod tests {
         assert_eq!(
             mixes_with_plays(&library, &["Band A"], &played)[0],
             ["a1", "t1", "n1"]
+        );
+    }
+
+    #[test]
+    fn what_was_heard_beside_the_artist_does_not_bring_in_a_song_of_another_style() {
+        // Jazzman is heard in every sitting of Band A, but its tags say it is not rock: the sittings say nothing of style.
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("j1", "Jazzman", &["Jazz"], &[]),
+            song("t1", "Tagged", &["Rock"], &[]),
+        ];
+        let mut played = vec![];
+        for i in 0..4 {
+            let t = i * 10 * 3600;
+            played.extend([heard("Band A", t), heard("Jazzman", t + 60)]);
+        }
+        assert_eq!(
+            mixes_with_plays(&library, &["Band A"], &played)[0],
+            ["a1", "t1"]
         );
     }
 
