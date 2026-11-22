@@ -877,6 +877,14 @@ mod tests {
         }
     }
 
+    /// A song of the one style, so that the artists of a test that need to share a mix fit each other.
+    fn rock(id: &str, artist: &str) -> taste::Song {
+        taste::Song {
+            genres: vec!["Rock".into()],
+            ..song(id, artist)
+        }
+    }
+
     fn call(store: &Store, url: &str, body: String, token: Option<&str>) -> (u16, String) {
         route(store, url, &body, token.map(String::from))
     }
@@ -1013,7 +1021,7 @@ mod tests {
         upload(
             &store,
             "1@x",
-            &[vec![song("a1", "Queen"), song("p1", "Portishead")]],
+            &[vec![rock("a1", "Queen"), rock("p1", "Portishead")]],
         );
         report_play(&store, "ana", "p1", "Portishead", 100);
         // The album listing names Queen; the play says Portishead, which is the more recent artist.
@@ -1248,7 +1256,11 @@ mod tests {
         let store = paired("dedup");
         let songs: Vec<taste::Song> = ["P0", "N0", "N1", "N2"]
             .iter()
-            .map(|a| song(&a.to_lowercase(), a))
+            // N2 is of no style, so that nothing brings it in as a similar song: it is in only if it is a seed.
+            .map(|a| match *a {
+                "N2" => song("n2", a),
+                _ => rock(&a.to_lowercase(), a),
+            })
             .collect();
         upload(&store, "1@x", &[songs]);
         report_play(&store, "ana", "p0", "P0", 100);
@@ -1266,14 +1278,18 @@ mod tests {
         let store = paired("all-time");
         let counted = |id: &str, artist: &str, count: u32| taste::Song {
             play_count: Some(count),
-            ..song(id, artist)
+            ..rock(id, artist)
         };
         let mut songs = vec![
             counted("fav1", "Old Favourite", 90),
             counted("mid1", "Mid", 50),
-            counted("x1", "Hardly", 1),
+            // Not a seed, and of no style: nothing brings it in as a similar song.
+            taste::Song {
+                genres: vec![],
+                ..counted("x1", "Hardly", 1)
+            },
         ];
-        songs.extend((0..3).map(|i| song(&format!("r{i}"), &format!("R{i}"))));
+        songs.extend((0..3).map(|i| rock(&format!("r{i}"), &format!("R{i}"))));
         upload(&store, "1@x", &[songs]);
         for i in 0..3 {
             report_play(&store, "ana", &format!("r{i}"), &format!("R{i}"), 100 + i);
