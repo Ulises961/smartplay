@@ -32,6 +32,8 @@ pub struct Report {
     pub seeds: Vec<String>,
     /// The mixes now, as lines of `artist - title`.
     pub mixes: Vec<Vec<String>>,
+    /// What each of the mixes is made of, in the same order.
+    pub mix_stats: Vec<MixStats>,
     pub holdout: Option<Holdout>,
     /// The same check made without what outside services say, when something is known of the artists: what they add.
     pub holdout_without_enrichment: Option<Holdout>,
@@ -39,6 +41,15 @@ pub struct Report {
     pub coverage: f64,
     /// The share of the songs of the mixes that are of the artist with most songs in them.
     pub top_artist_share: f64,
+}
+
+/// How a mix holds together.
+#[derive(Debug, Default, PartialEq)]
+pub struct MixStats {
+    /// How well its artists fit each other (see `mix::mix_fit`); none for a mix of one artist.
+    pub fit: Option<f64>,
+    /// Its artists with the most songs in it, and how many each has.
+    pub top_artists: Vec<(String, usize)>,
 }
 
 /// The hold-out check.
@@ -163,6 +174,25 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
             in_mixes.len(),
         ),
         seeds,
+        mix_stats: mixes
+            .iter()
+            .map(|ids| {
+                let mut count: HashMap<String, (String, usize)> = HashMap::new();
+                for song in ids.iter().filter_map(|id| index.by_id.get(id.as_str())) {
+                    count
+                        .entry(fold(&song.artist))
+                        .or_insert((song.artist.clone(), 0))
+                        .1 += 1;
+                }
+                let mut top_artists: Vec<(String, usize)> = count.into_values().collect();
+                top_artists.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                top_artists.truncate(4);
+                MixStats {
+                    fit: mix::mix_fit(library, ids, played, decisions, enrichment),
+                    top_artists,
+                }
+            })
+            .collect(),
         mixes: mixes
             .iter()
             .map(|m| {
@@ -258,6 +288,21 @@ impl Report {
         let _ = writeln!(out, "seeds: {}", self.seeds.join(", "));
         for (i, mix) in self.mixes.iter().enumerate() {
             let _ = writeln!(out, "\nmix {} ({} songs)", i + 1, mix.len());
+            if let Some(stats) = self.mix_stats.get(i) {
+                let fit = stats
+                    .fit
+                    .map_or("one artist".to_string(), |f| format!("{f:.2}"));
+                let artists: Vec<String> = stats
+                    .top_artists
+                    .iter()
+                    .map(|(name, n)| format!("{name} {n} ({:.0}%)", 100.0 * ratio(*n, mix.len())))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "  fit of its artists: {fit}; most songs: {}",
+                    artists.join(", ")
+                );
+            }
             for song in mix {
                 let _ = writeln!(out, "  {song}");
             }
@@ -383,6 +428,24 @@ mod tests {
         assert_eq!(h.artist_hits, 15);
         assert!(h.artist_lift() > 1.5, "{h:?}");
         assert!(report.render().contains("lift"));
+    }
+
+    #[test]
+    fn each_mix_says_how_well_its_artists_fit_and_who_has_most_songs() {
+        let library = library();
+        let mut played = vec![];
+        for (day, artist) in [(0, "J1"), (1, "R1"), (2, "R2"), (3, "J2")] {
+            let first = library.iter().find(|s| s.artist == artist).unwrap();
+            played.push(play(first, day * DAY));
+        }
+        let report = report(&library, &played);
+        assert_eq!(report.mixes.len(), 2, "rock and jazz are told apart");
+        assert_eq!(report.mix_stats.len(), 2);
+        for stats in &report.mix_stats {
+            assert!(stats.fit.is_some_and(|f| f > 0.9), "{stats:?}");
+            assert_eq!(stats.top_artists.iter().map(|a| a.1).sum::<usize>(), 10);
+        }
+        assert!(report.render().contains("fit of its artists: 1.00"));
     }
 
     #[test]
