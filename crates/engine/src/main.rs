@@ -24,7 +24,7 @@ const CODE_LIFETIME_SECS: u64 = 15 * 60;
 /// The playlist every granted user gets, and how many songs it holds.
 const PLAYLIST: &str = "smartplay";
 const PLAYLIST_SIZE: usize = 50;
-/// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
+/// The mixes of the artists a user played lately are `smartplay: mix 1`, `mix 2` and so on, this many songs each.
 const MIX_PLAYLIST: &str = "smartplay: mix";
 const MIX_SIZE: usize = 50;
 
@@ -390,7 +390,7 @@ fn main() {
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
              smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
              smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
-             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X] [--data DIR]\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
@@ -570,7 +570,7 @@ fn eval_command(store: Store, args: &[String]) {
     let words = positional(args);
     let [server, user] = words.as_slice() else {
         return eprintln!(
-            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X]"
+            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-aligned X] [--max-share X] [--max-mixes N]"
         );
     };
     let tuning = {
@@ -579,6 +579,7 @@ fn eval_command(store: Store, args: &[String]) {
             min_aligned: share("--min-aligned", base.min_aligned),
             min_fit: share("--min-fit", base.min_fit),
             max_artist_share: share("--max-share", base.max_artist_share),
+            max_mixes: number("--max-mixes", base.max_mixes as i64).max(1) as usize,
         }
     };
     let Some(library) = store.library(server, user) else {

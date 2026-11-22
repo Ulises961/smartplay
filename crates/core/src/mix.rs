@@ -18,8 +18,6 @@ use crate::taste::Song;
 /// Of every [`ROUND`] songs of a mix, this many come from the artists played and the rest are similar songs: 60%.
 const BASE_PER_ROUND: usize = 3;
 const ROUND: usize = 5;
-/// At most this many mixes are made; the artists of the most recent groups come first.
-const MAX_MIXES: usize = 2;
 /// A mix shorter than this is left out when a longer one exists (or is the only one left when none is that long).
 const MIN_MIX_SONGS: usize = 10;
 
@@ -33,6 +31,8 @@ pub struct Tuning {
     pub min_fit: f64,
     /// The share of a mix one artist may take while others can still fill it; it is lifted only to fill what is left.
     pub max_artist_share: f64,
+    /// At most this many mixes are made; the groups with the most recent artists come first.
+    pub max_mixes: usize,
 }
 
 impl Default for Tuning {
@@ -41,6 +41,7 @@ impl Default for Tuning {
             min_aligned: 0.4,
             min_fit: 0.5,
             max_artist_share: 0.2,
+            max_mixes: 3,
         }
     }
 }
@@ -58,7 +59,7 @@ const MIN_CROWD_TAG: f64 = 0.3;
 
 type Profile = HashMap<String, f64>;
 
-/// At most [`MAX_MIXES`] mixes of up to `size` songs each, built from `recent` (artist names, most recent first).
+/// At most `Tuning::max_mixes` mixes of up to `size` songs each, built from `recent` (artist names, most recent first).
 ///
 /// The recent artists are told apart by identity, not spelling. They are grouped by how well they fit each other (their
 /// tags, what was heard in the same sittings, what outside services call close): artists that fit share a mix, and one
@@ -152,7 +153,7 @@ pub fn recent_artist_mixes_explained(
     let mut mixes: Vec<Vec<Chosen>> = vec![];
     let mut short: Vec<Vec<Chosen>> = vec![];
     for group in align(&recent_artists, &affinity, tuning.min_aligned) {
-        if mixes.len() == MAX_MIXES {
+        if mixes.len() == tuning.max_mixes {
             break;
         }
         let mut profile = Profile::new();
@@ -1290,6 +1291,35 @@ mod tests {
             &["R1", "R2"],
         );
         assert_eq!((together.len(), apart.len()), (1, 2));
+    }
+
+    #[test]
+    fn the_number_of_mixes_follows_the_groups_of_artists_up_to_the_most_asked_for() {
+        let mut library = rock_and_classical(12);
+        for i in 0..12 {
+            library.push(song(&format!("J1-{i}"), "J1", &["Jazz"], &[]));
+        }
+        let run = |max_mixes: usize| {
+            recent_artist_mixes_explained(
+                &library,
+                &names(&["R1", "Chopin", "J1"]),
+                &[],
+                &Decisions::default(),
+                &Enrichment::default(),
+                10,
+                &Tuning {
+                    max_mixes,
+                    ..Tuning::default()
+                },
+            )
+        };
+        assert_eq!(run(Tuning::default().max_mixes).len(), 3);
+        assert_eq!(
+            run(2).len(),
+            2,
+            "the groups of the latest artists come first"
+        );
+        assert_eq!(run(1).len(), 1);
     }
 
     #[test]
