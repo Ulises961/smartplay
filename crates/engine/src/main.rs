@@ -56,8 +56,9 @@ impl Store {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
-    fn save(&self, servers: &[Server]) {
-        fs::write(&self.0, serde_json::to_string_pretty(servers).unwrap()).expect("write state");
+    fn save(&self, servers: &[Server]) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(servers).map_err(|e| e.to_string())?;
+        fs::write(&self.0, text).map_err(|e| format!("cannot write {}: {e}", self.0.display()))
     }
 
     /// Where a server's copy of a user's library lives. Names are hex-encoded: any user name is a safe file name.
@@ -99,7 +100,8 @@ impl Store {
             songs,
         };
         let done = self.library_path(server, &chunk.user, "tmp");
-        fs::write(&done, serde_json::to_string(&stored).unwrap()).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+        fs::write(&done, text).map_err(|e| e.to_string())?;
         fs::rename(&done, self.library_path(server, &chunk.user, "json"))
             .map_err(|e| e.to_string())?;
         let _ = fs::remove_file(part);
@@ -123,7 +125,8 @@ impl Store {
     fn save_lastfm(&self, cache: &lastfm::Cache) -> Result<(), String> {
         let path = self.lastfm_path();
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_string(cache).unwrap()).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string(cache).map_err(|e| e.to_string())?;
+        fs::write(&tmp, text).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
@@ -144,7 +147,9 @@ impl Store {
     fn keep_recent(&self, server: &str, user: &str, recent: &[String]) {
         let path = self.recent_path(server, user);
         if self.recent(server, user) != recent {
-            let _ = fs::write(path, serde_json::to_string(recent).unwrap());
+            if let Ok(text) = serde_json::to_string(recent) {
+                let _ = fs::write(path, text); // only for `eval`: a miss costs nothing
+            }
         }
     }
 
@@ -186,8 +191,8 @@ impl Store {
                 tallies,
             };
             let tmp = path.with_extension("tmp");
-            fs::write(&tmp, serde_json::to_string(&baseline).unwrap())
-                .map_err(|e| e.to_string())?;
+            let text = serde_json::to_string(&baseline).map_err(|e| e.to_string())?;
+            fs::write(&tmp, text).map_err(|e| e.to_string())?;
             fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         }
         for song in songs {
@@ -211,14 +216,17 @@ impl Store {
     }
 
     /// Changes a user's decisions and keeps them.
-    fn remember(&self, server: &str, user: &str, change: impl FnOnce(&mut Decisions)) {
+    fn remember(
+        &self,
+        server: &str,
+        user: &str,
+        change: impl FnOnce(&mut Decisions),
+    ) -> Result<(), String> {
         let mut decisions = self.decisions(server, user);
         change(&mut decisions);
-        fs::write(
-            self.decisions_path(server, user),
-            serde_json::to_string_pretty(&decisions).unwrap(),
-        )
-        .expect("write decisions");
+        let path = self.decisions_path(server, user);
+        let text = serde_json::to_string_pretty(&decisions).map_err(|e| e.to_string())?;
+        fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
     fn plays_path(&self, server: &str, user: &str) -> PathBuf {
@@ -325,33 +333,41 @@ struct ImportReport {
     failed: Option<String>,
 }
 
+/// Seconds since 1970. A clock set before that reads as 0, so codes and plays are wrong rather than the engine down.
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
-fn random_text(len: usize, alphabet: &[u8]) -> String {
+/// Tells why a command could not do what it was asked, and ends it with a status that is not 0.
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("smartplay-engine: {message}");
+    std::process::exit(1)
+}
+
+fn random_text(len: usize, alphabet: &[u8]) -> Result<String, String> {
     let mut buf = vec![0u8; len];
     fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("urandom");
-    buf.iter()
+        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+    Ok(buf
+        .iter()
         .map(|b| alphabet[*b as usize % alphabet.len()] as char)
-        .collect()
+        .collect())
 }
 
-fn new_code() -> String {
+fn new_code() -> Result<String, String> {
     // No 0/O/1/I: the code is read off a log and typed or pasted by a person.
     random_text(8, b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
 }
 
-fn issue_code(server: &mut Server) -> String {
-    let code = new_code();
+fn issue_code(server: &mut Server) -> Result<String, String> {
+    let code = new_code()?;
     server.code = Some(code.clone());
     server.code_expires = now() + CODE_LIFETIME_SECS;
-    code
+    Ok(code)
 }
 
 fn banner(lines: &[String]) {
@@ -623,13 +639,15 @@ fn purge_command(store: Store, args: &[String]) {
 fn artists_command(store: Store, args: &[String]) {
     match positional(args).as_slice() {
         [verb @ ("same" | "different"), server, user, a, b] => {
-            store.remember(server, user, |d| {
+            if let Err(e) = store.remember(server, user, |d| {
                 if *verb == "same" {
                     d.same(a, b)
                 } else {
                     d.different(a, b)
                 }
-            });
+            }) {
+                fail(e);
+            }
             println!("kept: '{a}' and '{b}' are {verb} for {user} on {server}");
         }
         ["list", server, user] => {
@@ -693,14 +711,14 @@ fn servers_command(store: Store, args: &[String]) {
                 code_expires: 0,
                 token: None,
             };
-            let code = issue_code(&mut s);
+            let code = issue_code(&mut s).unwrap_or_else(|e| fail(e));
             servers.push(s);
-            store.save(&servers);
+            store.save(&servers).unwrap_or_else(|e| fail(e));
             println!("enrollment code for '{name}' (valid 15 minutes): {code}");
         }
         (Some("remove"), Some(name)) => {
             servers.retain(|s| &s.name != name);
-            store.save(&servers);
+            store.save(&servers).unwrap_or_else(|e| fail(e));
             store.forget_data(name);
             println!(
                 "removed '{name}': its token no longer works and its library copies and artist decisions are deleted"
@@ -735,13 +753,10 @@ fn serve(store: Store, bind: &str) {
     }
     let mut waiting = vec![];
     for s in servers.iter_mut().filter(|s| s.token.is_none()) {
-        waiting.push(format!(
-            "server '{}'  code: {}",
-            s.name.clone(),
-            issue_code(s)
-        ));
+        let code = issue_code(s).unwrap_or_else(|e| fail(e));
+        waiting.push(format!("server '{}'  code: {code}", s.name));
     }
-    store.save(&servers);
+    store.save(&servers).unwrap_or_else(|e| fail(e));
     if !waiting.is_empty() {
         let mut lines = vec![
             "ENGINE READY - ACTION NEEDED: connect your music server".to_string(),
@@ -754,7 +769,8 @@ fn serve(store: Store, bind: &str) {
         lines.push("restart the engine (or run `servers add NAME`) for a new one.".to_string());
         banner(&lines);
     }
-    let http = tiny_http::Server::http(bind).expect("bind");
+    let http = tiny_http::Server::http(bind)
+        .unwrap_or_else(|e| fail(format!("cannot listen on {bind}: {e}")));
     println!("listening on {bind}");
     for mut request in http.incoming_requests() {
         let mut body = String::new();
@@ -782,15 +798,20 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
             else {
                 return (403, "unknown or expired code".into());
             };
-            let token = random_text(40, b"abcdefghijklmnopqrstuvwxyz0123456789");
+            let token = match random_text(40, b"abcdefghijklmnopqrstuvwxyz0123456789") {
+                Ok(token) => token,
+                Err(e) => return failed(e),
+            };
             s.token = Some(token.clone());
             s.code = None; // single use
-            store.save(&servers);
+            if let Err(e) = store.save(&servers) {
+                return failed(e); // not enrolled: the plugin still has the code, which is kept on disk
+            }
             println!("server enrolled");
-            (
-                200,
-                serde_json::to_string(&EnrollResponse { token }).unwrap(),
-            )
+            match serde_json::to_string(&EnrollResponse { token }) {
+                Ok(reply) => (200, reply),
+                Err(e) => failed(e),
+            }
         }
         "/compute" | "/library" | "/play" => {
             let Some(server) = bearer.and_then(|token| {
@@ -862,10 +883,20 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 }
                 _ => ComputeResponse::NeedLibrary,
             };
-            (200, serde_json::to_string(&answer).unwrap())
+            match serde_json::to_string(&answer) {
+                Ok(reply) => (200, reply),
+                Err(e) => failed(e),
+            }
         }
         _ => (404, "not found".into()),
     }
+}
+
+/// The answer to a request the engine could not serve for a reason of its own (a full disk, no random source): the cause
+/// goes to the engine's log, and the plugin only hears that it failed, so it asks again later.
+fn failed(cause: impl std::fmt::Display) -> (u16, String) {
+    eprintln!("smartplay-engine: {cause}");
+    (500, "the engine could not do that".into())
 }
 
 #[cfg(test)]
@@ -878,12 +909,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let store = Store(dir.join("servers.json"));
-        store.save(&[Server {
-            name: "home".into(),
-            code: None,
-            code_expires: 0,
-            token: Some("tok".into()),
-        }]);
+        store
+            .save(&[Server {
+                name: "home".into(),
+                code: None,
+                code_expires: 0,
+                token: Some("tok".into()),
+            }])
+            .unwrap();
         store
     }
 
@@ -1209,7 +1242,9 @@ mod tests {
     fn a_purge_deletes_one_user_and_leaves_the_others() {
         let store = paired("purge");
         upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
-        store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
+        store
+            .remember("home", "ana", |d| d.same("Queen", "Queen band"))
+            .unwrap();
         report_play(&store, "ana", "a1", "Queen", 100);
         report_play(&store, "anabel", "a1", "Queen", 100);
         store.forget_user("home", "ana");
@@ -1395,10 +1430,50 @@ mod tests {
     }
 
     #[test]
+    fn a_state_that_cannot_be_written_is_an_error_naming_the_file_and_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!("smartplay-{}-nowrite", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // The folder does not exist, as when a volume is gone: every write fails.
+        let store = Store(dir.join("servers.json"));
+        let e = store.save(&[]).unwrap_err();
+        assert!(e.contains("servers.json"), "{e}");
+        assert!(store.remember("home", "ana", |_| {}).is_err());
+    }
+
+    #[test]
+    fn an_enrollment_that_cannot_be_saved_is_answered_with_an_error_and_the_code_still_works_later()
+    {
+        let store = paired("enroll-readonly");
+        let code = r#"{"code":"ABCD2345"}"#;
+        store
+            .save(&[Server {
+                name: "home".into(),
+                code: Some("ABCD2345".into()),
+                code_expires: now() + 600,
+                token: None,
+            }])
+            .unwrap();
+        let mut permissions = fs::metadata(&store.0).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&store.0, permissions.clone()).unwrap();
+        if fs::OpenOptions::new().append(true).open(&store.0).is_ok() {
+            // This user ignores the permission (root): there is no way to make the write fail here.
+            return;
+        }
+        assert_eq!(call(&store, "/enroll", code.into(), None).0, 500);
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&store.0, permissions).unwrap();
+        assert_eq!(call(&store, "/enroll", code.into(), None).0, 200);
+    }
+
+    #[test]
     fn removing_a_server_deletes_its_library_copies_and_decisions() {
         let store = paired("remove");
         upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
-        store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
+        store
+            .remember("home", "ana", |d| d.same("Queen", "Queen band"))
+            .unwrap();
         report_play(&store, "ana", "a1", "Queen", 100);
         assert!(store.library("home", "ana").is_some());
         assert_eq!(store.plays("home", "ana").len(), 1);
@@ -1426,14 +1501,18 @@ mod tests {
         };
         assert_eq!(compute(&store, "1@x"), empty, "nothing joins them yet");
 
-        store.remember("home", "bea", |d| {
-            d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
-        });
+        store
+            .remember("home", "bea", |d| {
+                d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
+            })
+            .unwrap();
         assert_eq!(compute(&store, "1@x"), empty, "another user's decision");
 
-        store.remember("home", "ana", |d| {
-            d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
-        });
+        store
+            .remember("home", "ana", |d| {
+                d.same("Los Redondos", "Patricio Rey y sus Redonditos de Ricota")
+            })
+            .unwrap();
         assert_eq!(
             compute(&store, "1@x"),
             ComputeResponse::Playlist {
@@ -1459,8 +1538,10 @@ mod tests {
     #[test]
     fn decisions_are_kept_between_runs_and_added_to() {
         let store = paired("keep");
-        store.remember("home", "ana", |d| d.same("A", "B"));
-        store.remember("home", "ana", |d| d.different("C", "D"));
+        store.remember("home", "ana", |d| d.same("A", "B")).unwrap();
+        store
+            .remember("home", "ana", |d| d.different("C", "D"))
+            .unwrap();
         let d = store.decisions("home", "ana");
         assert_eq!(d.same_pairs().count(), 1);
         assert_eq!(d.different_pairs().count(), 1);
