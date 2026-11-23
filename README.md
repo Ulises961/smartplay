@@ -43,7 +43,7 @@ internet; if the engine runs on another host than Navidrome, put it behind HTTPS
 ```bash
 ./target/release/smartplay-engine servers list              # paired or waiting for enrollment
 ./target/release/smartplay-engine servers add NAME          # another server entry, with a fresh code
-./target/release/smartplay-engine servers remove NAME       # revokes its token at once; deletes its library copies, decisions and plays
+./target/release/smartplay-engine servers remove NAME       # revokes its token at once; deletes its library copies, decisions, plays and play counts
 ```
 
 A library often names one artist several ways (`Los Redondos`, `Patricio Rey y sus Redonditos de Ricota`). The engine
@@ -89,17 +89,34 @@ the engine, the plugin drops its token and logs `engine rejected the token`; ent
 Star songs in any Subsonic client. Within a minute each granted user finds a playlist named `smartplay`. Grant or
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
-Play some songs and each user also finds up to two playlists, `smartplay: mix 1` and `smartplay: mix 2`, built from the
-artists they played last: about 60% songs of those artists and 40% songs of other artists. Those are the ones whose
-genres and moods are close, and the ones the user tends to play in the same sitting (plays less than an hour apart) as
-the artists of the mix. When the songs carry tags, the artists are split between the two mixes by how alike they are.
-They work for a user who has starred nothing, and they are ordinary playlists too.
+Play some songs and each user also finds up to three playlists, `smartplay: mix 1`, `smartplay: mix 2` and
+`smartplay: mix 3`, of up to 50 songs each, built from the artists they played last. The recent artists are grouped by how
+well they fit each other, so artists that sound unlike do not share a mix, and one artist does not take a mix over.
+About 60% of a mix are songs of those artists, and 40% are songs of other artists: the ones whose genres and moods are
+close, the ones that outside services (see Last.fm below) call close, and the ones the user tends to play in the same
+sitting (plays less than an hour apart) as the artists of the mix. A song only gets in if it fits well enough, so a mix may
+be shorter than 50 songs rather than filled with weak matches. They work for a user who has starred nothing, and they are
+ordinary playlists too.
 
 The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what was played
-a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps only the latest 500 plays of each user, with the song, its artists and the time: enough to
-know what was played lately, not a history of listening. If the engine cannot be reached, Navidrome holds the play and
-sends it again. Before the engine has heard of any play, and for what was played before the plugin was installed, the
-mixes start from the artists of the albums the server lists as recently played.
+a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps the plays of each user for two years
+(see Privacy). If the engine cannot be reached, Navidrome holds the play and sends it again. Before the engine has heard
+of any play, and for what was played before the plugin was installed, the mixes start from the play counts of the first
+copy of the library the engine received and from the artists of the albums the server lists as recently played.
+
+To see why a song is in a mix, run `eval` (see [deploy/README.md](deploy/README.md)): it prints each mix with the reason
+of every song, how well the artists of each mix fit, and how well the mixes would have predicted the last days of plays.
+It can also try other thresholds without a new build.
+
+### Last.fm (optional)
+
+Two commands of the engine use Last.fm, and nothing else does. Both are run by the operator, with the operator's own API
+key, and neither runs on its own:
+
+- `enrich` asks Last.fm for the tags and the close artists of the artists of a library. It sends artist names and your API
+  key, and nothing else, to Last.fm. What it answers widens the mixes for every user.
+- `import-lastfm` brings the history of a user's Last.fm account in as plays. It sends the Last.fm user name and your API
+  key, and nothing of the library.
 
 `smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
 example to keep only unplayed songs, or songs of one genre, in random order:
@@ -120,9 +137,21 @@ example to keep only unplayed songs, or songs of one genre, in random order:
 ## Privacy
 
 Self-hosted software: the authors run no service, receive no data and include no telemetry. Everything stored stays on
-the machine where you run it, in the engine's data folder: each granted user's library, their decisions about artist
-names, and the latest 500 plays (song, artists, time). Removing a server on the engine deletes all of it. You, as the operator, are responsible for how you use this software, including informing
-the users of your server.
+the machine where you run it, in the engine's data folder:
+
+- each granted user's library (their songs as the server lists them) and their decisions about artist names;
+- **a history of their plays, kept for two years and then dropped**: for each play, the song, its artists, the time it
+  started and, when the source says, the title, album, length, how much was heard, and where the play was reported from
+  (the plugin, or an import). This is a history of listening, and it is what the mixes are made from;
+- the play counts of the first copy of the library the engine received, and the artists of the albums the plugin last
+  listed as recent;
+- the tags and close artists Last.fm gave for artist names, if you ran `enrich`. They are kept in one file for every user,
+  `enrichment-lastfm.json`, and they are not removed by the commands below: delete the file to remove them.
+
+Removing a server on the engine (`servers remove NAME`) deletes the library copies, decisions, plays, play counts and recent
+artists of that server's users, and `purge SERVER USER` does the same for one user. Nothing leaves the machine except what
+you send to Last.fm yourself (see above), and the plugin's calls to the engine. You, as the operator, are responsible for
+how you use this software, including informing the users of your server.
 
 ## Contributing
 
