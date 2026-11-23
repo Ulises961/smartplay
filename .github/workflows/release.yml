@@ -20,8 +20,10 @@ jobs:
         with:
           targets: wasm32-wasip1
       - run: ./scripts/fetch-deps.sh
+      - name: The tag is the version of the crates and of the plugin
+        run: ./scripts/check-version.sh "$GITHUB_REF_NAME"
       - name: Test
-        run: cargo test -p smartplay-core -p smartplay-engine
+        run: cargo test --workspace --exclude smartplay-plugin
       - name: Package the plugin
         run: |
           cargo build -p smartplay-plugin --release --target wasm32-wasip1
