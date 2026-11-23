@@ -1,22 +1,30 @@
 # The engine as one more service of a Navidrome compose stack. Add it beside the `navidrome` service, in the same file.
 #
 # It joins the stack's own network and publishes no port, so nothing outside the stack can reach it. The plugin runs inside
-# Navidrome and reaches the engine by its name on that network (`http://smartplay-engine:7788`, the container_name below),
-# which follows the container when it is recreated. The plugin's manifest must list the network's range in
-# `requiredHosts`: a name alone never authorizes a private address (see README.md).
+# Navidrome and calls the engine by its service name, `smartplay-engine`: Docker's DNS gives the name the engine's current
+# address, so recreating the container changes nothing in the plugin's settings. The plugin may only reach the hosts its
+# manifest lists, so the stack's network is given a fixed range, and that range is what goes into the plugin (README.md).
 services:
   smartplay-engine:
-    image: debian:bookworm-slim
-    container_name: smartplay-engine
+    # VERSION: a release of the engine (see the releases of the repository).
+    image: ghcr.io/ulises961/smartplay-engine:VERSION
     restart: unless-stopped
-    # The user that owns the folder of the engine's state (see README.md).
-    user: "1000:1000"
-    command: ["/opt/smartplay-engine", "serve", "--bind", "0.0.0.0:7788", "--data", "/state"]
     volumes:
-      - "./smartplay/smartplay-engine:/opt/smartplay-engine:ro"
-      - "./smartplay/state:/state"
+      - smartplay-state:/state
     mem_limit: 128m
     cpus: 0.5
+
+volumes:
+  smartplay-state:
+
+# The network the services share. Put the range the stack has now (README.md, step 1): a different one recreates the network
+# and restarts every service on it, Navidrome included. If the stack already declares `networks: default:`, add the `ipam`
+# part to it.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 # And on the `navidrome` service, to let it load plugins:
 #   environment:

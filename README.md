@@ -61,14 +61,17 @@ library are never changed):
 
 ### Plugin
 
-Navidrome may only reach a private engine address that the plugin lists. Put the engine's IP address (or CIDR) in
-`requiredHosts` in `crates/plugin/manifest.json` (it ships with `172.17.0.1`, Docker's default host address), then:
-
 ```bash
 cargo build -p smartplay-plugin --release --target wasm32-wasip1
 cp target/wasm32-wasip1/release/smartplay_plugin.wasm plugin.wasm
 zip -j smartplay.ndp crates/plugin/manifest.json plugin.wasm
 ```
+
+The plugin may only call the hosts that `requiredHosts` lists in its manifest, and Navidrome never lets a host name alone
+reach a private address. The package ships with only `smartplay-engine` (the engine's name on a compose stack), so before
+copying it, add the IP address or range of the engine's network to the manifest inside `smartplay.ndp`, or the name or
+address of an engine that runs elsewhere. [deploy/README.md](deploy/README.md), step 3, has the commands and a table of
+cases.
 
 Copy `smartplay.ndp` into Navidrome's plugins folder, then in Navidrome's admin pages:
 
