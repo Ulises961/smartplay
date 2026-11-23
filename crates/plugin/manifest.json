@@ -7,7 +7,7 @@
     "schema": {
       "type": "object",
       "properties": {
-        "engine_url": { "type": "string", "title": "Engine address", "description": "For example http://172.17.0.1:7788" },
+        "engine_url": { "type": "string", "title": "Engine address", "description": "For example http://smartplay-engine:7788. The host must be listed in the plugin's permissions: see deploy/README.md" },
         "enrollment_code": { "type": "string", "title": "Enrollment code", "description": "One-time code printed by the engine" }
       }
     }
@@ -17,6 +17,6 @@
     "subsonicapi": { "reason": "Read starred songs and write playlists as the granted users" },
     "users": { "reason": "Act only for the users the admin granted" },
     "kvstore": { "reason": "Keep the engine token", "maxSize": "64KB" },
-    "http": { "reason": "Talk to the engine", "requiredHosts": ["172.17.0.1"] }
+    "http": { "reason": "Talk only to the engine, at the address set in the plugin's settings. The hosts it may reach are listed in requiredHosts, and only the engine's name is listed here: the range of its network is added when installing (deploy/README.md)", "requiredHosts": ["smartplay-engine"] }
   }
 }
