@@ -7,7 +7,7 @@
 //!
 //! Pure functions over a snapshot of the library, like `taste`: nothing is read from a server and nothing is kept.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::enrich::Enrichment;
 use crate::identity::{resolve, Decisions, Track};
@@ -63,7 +63,7 @@ const SIMILAR_WEIGHT: f64 = 0.5;
 /// ones describe a few listeners' habits and not the artist.
 const MIN_CROWD_TAG: f64 = 0.3;
 
-type Profile = HashMap<String, f64>;
+type Profile = BTreeMap<String, f64>;
 
 /// At most `Tuning::max_mixes` mixes of up to `size` songs each, built from `recent` (artist names, most recent first).
 ///
@@ -155,7 +155,7 @@ pub fn recent_artist_mixes_explained(
     let minimum = MIN_MIX_SONGS.min(size);
     let cap = ((size as f64 * tuning.max_artist_share).ceil() as usize).max(1);
 
-    let mut used: HashSet<&str> = HashSet::new();
+    let mut used: BTreeSet<&str> = BTreeSet::new();
     let mut mixes: Vec<Vec<Chosen>> = vec![];
     let mut short: Vec<Vec<Chosen>> = vec![];
     for group in align(&recent_artists, &affinity, tuning.min_aligned) {
@@ -172,7 +172,7 @@ pub fn recent_artist_mixes_explained(
         let close = close_artists(&group, clusters, enrichment, &artist);
         let rank = |a: usize| recent_artists.iter().position(|&r| r == a).unwrap_or(0);
 
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
         let (mut base, mut similar) = (vec![], vec![]);
         for ((song, a), song_tags) in songs.iter().zip(tags) {
             if used.contains(song.id.as_str()) || !seen.insert(song.id.as_str()) {
@@ -239,7 +239,7 @@ pub fn recent_artist_mixes_explained(
             short.push(list);
             continue;
         }
-        let in_list: HashSet<&str> = list.iter().map(|c| c.id.as_str()).collect();
+        let in_list: BTreeSet<&str> = list.iter().map(|c| c.id.as_str()).collect();
         used.extend(
             library
                 .iter()
@@ -268,10 +268,10 @@ fn fill(base: &[Chosen], similar: &[Chosen], size: usize) -> Vec<Chosen> {
 /// What the mixes and their checks are worked out from: who is who, the tags of the songs and what was heard together.
 struct Basis {
     clusters: Vec<crate::identity::Cluster>,
-    artist_of_name: HashMap<String, usize>,
-    tags: Vec<HashSet<String>>,
-    weight: HashMap<String, f64>,
-    sittings: Vec<HashSet<usize>>,
+    artist_of_name: BTreeMap<String, usize>,
+    tags: Vec<BTreeSet<String>>,
+    weight: BTreeMap<String, f64>,
+    sittings: Vec<BTreeSet<usize>>,
 }
 
 impl Basis {
@@ -291,13 +291,13 @@ impl Basis {
             })
             .collect();
         let clusters = resolve(&tracks, decisions).clusters;
-        let mut artist_of_name: HashMap<String, usize> = HashMap::new();
+        let mut artist_of_name: BTreeMap<String, usize> = BTreeMap::new();
         for (i, cluster) in clusters.iter().enumerate() {
             for spelling in &cluster.spellings {
                 artist_of_name.insert(fold(spelling), i);
             }
         }
-        let tags: Vec<HashSet<String>> = library.iter().map(|s| tags_of(s, enrichment)).collect();
+        let tags: Vec<BTreeSet<String>> = library.iter().map(|s| tags_of(s, enrichment)).collect();
         let weight = idf(&tags);
         let mut basis = Basis {
             clusters,
@@ -329,8 +329,8 @@ impl Basis {
         &self,
         songs: &[(&Song, Option<usize>)],
         wanted: &[usize],
-    ) -> HashMap<usize, Profile> {
-        let mut profiles: HashMap<usize, Profile> = HashMap::new();
+    ) -> BTreeMap<usize, Profile> {
+        let mut profiles: BTreeMap<usize, Profile> = BTreeMap::new();
         for ((_, a), song_tags) in songs.iter().zip(&self.tags) {
             if let Some(a) = a.filter(|a| wanted.contains(a)) {
                 let profile = profiles.entry(a).or_default();
@@ -365,7 +365,7 @@ pub fn mix_fit(
             )
         })
         .collect();
-    let ids: HashSet<&str> = mix.iter().map(String::as_str).collect();
+    let ids: BTreeSet<&str> = mix.iter().map(String::as_str).collect();
     let mut artists: Vec<usize> = vec![];
     for (song, a) in &songs {
         if let Some(a) = a.filter(|a| ids.contains(song.id.as_str()) && !artists.contains(a)) {
@@ -390,10 +390,10 @@ pub fn mix_fit(
 /// How often each other artist was heard in the sittings of `group`, between 0 and 1: the sittings holding both, over
 /// the geometric mean of the sittings holding the group and those holding the artist. An artist always heard alone
 /// scores 0, and one the group's artists are heard with every time scores 1.
-fn co_listening(sittings: &[HashSet<usize>], group: &[usize]) -> HashMap<usize, f64> {
-    let with_group = |s: &&HashSet<usize>| group.iter().any(|a| s.contains(a));
+fn co_listening(sittings: &[BTreeSet<usize>], group: &[usize]) -> BTreeMap<usize, f64> {
+    let with_group = |s: &&BTreeSet<usize>| group.iter().any(|a| s.contains(a));
     let group_sittings = sittings.iter().filter(with_group).count();
-    let mut both: HashMap<usize, usize> = HashMap::new();
+    let mut both: BTreeMap<usize, usize> = BTreeMap::new();
     for sitting in sittings.iter().filter(with_group) {
         for &other in sitting.iter().filter(|o| !group.contains(o)) {
             *both.entry(other).or_default() += 1;
@@ -416,8 +416,8 @@ fn close_artists(
     clusters: &[crate::identity::Cluster],
     enrichment: &Enrichment,
     artist: &dyn Fn(&str) -> Option<usize>,
-) -> HashMap<usize, f64> {
-    let mut close: HashMap<usize, f64> = HashMap::new();
+) -> BTreeMap<usize, f64> {
+    let mut close: BTreeMap<usize, f64> = BTreeMap::new();
     for &a in group {
         let infos = clusters[a]
             .spellings
@@ -435,7 +435,7 @@ fn close_artists(
 
 /// The genres (every one the song has), the moods of a song and the crowd tags of its artist, folded. A mood and a genre
 /// of the same name are two tags, and so is a crowd tag (`l:`), which comes from another source.
-fn tags_of(song: &Song, enrichment: &Enrichment) -> HashSet<String> {
+fn tags_of(song: &Song, enrichment: &Enrichment) -> BTreeSet<String> {
     let genres: Vec<&str> = if song.genres.is_empty() {
         song.genre.as_deref().into_iter().collect()
     } else {
@@ -457,8 +457,8 @@ fn tags_of(song: &Song, enrichment: &Enrichment) -> HashSet<String> {
 }
 
 /// How much each tag says: `ln(1 + songs / songs with the tag)`, so a tag on every song weighs least.
-fn idf(tags: &[HashSet<String>]) -> HashMap<String, f64> {
-    let mut count: HashMap<&str, usize> = HashMap::new();
+fn idf(tags: &[BTreeSet<String>]) -> BTreeMap<String, f64> {
+    let mut count: BTreeMap<&str, usize> = BTreeMap::new();
     for t in tags.iter().flatten() {
         *count.entry(t.as_str()).or_default() += 1;
     }
@@ -473,7 +473,7 @@ fn norm<'a>(values: impl Iterator<Item = &'a f64>) -> f64 {
 }
 
 /// Cosine between a song's weighted tags and a profile: 0 when they share nothing, or when either has no tags.
-fn cosine(song: &HashSet<String>, weight: &HashMap<String, f64>, profile: &Profile) -> f64 {
+fn cosine(song: &BTreeSet<String>, weight: &BTreeMap<String, f64>, profile: &Profile) -> f64 {
     let dot: f64 = song
         .iter()
         .map(|t| weight[t] * profile.get(t).copied().unwrap_or(0.0))
@@ -504,15 +504,15 @@ fn cosine_profiles(a: &Profile, b: &Profile) -> f64 {
 /// smaller id first.
 fn affinities(
     recent: &[usize],
-    profiles: &HashMap<usize, Profile>,
-    sittings: &[HashSet<usize>],
+    profiles: &BTreeMap<usize, Profile>,
+    sittings: &[BTreeSet<usize>],
     clusters: &[crate::identity::Cluster],
     enrichment: &Enrichment,
     artist: &dyn Fn(&str) -> Option<usize>,
-) -> HashMap<(usize, usize), f64> {
+) -> BTreeMap<(usize, usize), f64> {
     let empty = Profile::new();
     let profile = |a: &usize| profiles.get(a).unwrap_or(&empty);
-    let mut affinity = HashMap::new();
+    let mut affinity = BTreeMap::new();
     for (i, &x) in recent.iter().enumerate() {
         let together = co_listening(sittings, &[x]);
         let close = close_artists(&[x], clusters, enrichment, artist);
@@ -537,7 +537,7 @@ fn affinities(
 /// no group stays alone. Each group keeps the recency order, and the groups come in the order of their latest artist.
 fn align(
     recent: &[usize],
-    affinity: &HashMap<(usize, usize), f64>,
+    affinity: &BTreeMap<(usize, usize), f64>,
     min_aligned: f64,
 ) -> Vec<Vec<usize>> {
     let between = |a: &[usize], b: &[usize]| {
@@ -605,8 +605,8 @@ fn song_key(song: &Song) -> String {
 /// demo, a live take and a remix of one song do not fill it. Only when no song is left within the cap do the artists
 /// that have more songs to give carry on, past it.
 fn pick(mut candidates: Vec<Candidate>, limit: usize, cap: usize) -> (Vec<Chosen>, usize) {
-    let mut picked_from: HashMap<usize, usize> = HashMap::new();
-    let mut picked_versions: HashMap<String, usize> = HashMap::new();
+    let mut picked_from: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut picked_versions: BTreeMap<String, usize> = BTreeMap::new();
     let mut list = vec![];
     let mut within_cap = None;
     while list.len() < limit && !candidates.is_empty() {
@@ -685,6 +685,55 @@ mod tests {
             &Enrichment::default(),
             size,
         )
+    }
+
+    #[test]
+    fn songs_that_tie_are_picked_by_their_ids_whatever_the_run() {
+        // Thirty songs of one artist with the same tags: their scores are equal, and only the order in which the tags are
+        // added up (a set has none) could tell them apart in the last digit. Other artists make the tags weigh differently.
+        let mut library = vec![];
+        for i in 0..30 {
+            library.push(song(
+                &format!("t{i:02}"),
+                "Tied",
+                &["Indie", "Pop", "Rock", "Dream"],
+                &["Calm", "Night", "Slow", "Sad"],
+            ));
+        }
+        for i in 0..40 {
+            let genres: &[&str] = match i % 4 {
+                0 => &["Rock"],
+                1 => &["Pop", "Indie"],
+                2 => &["Dream", "Rock"],
+                _ => &["Pop"],
+            };
+            library.push(song(
+                &format!("o{i:02}"),
+                &format!("Other {i}"),
+                genres,
+                &["Night"],
+            ));
+        }
+        let first = mixes(&library, &["Tied"], 50);
+        for _ in 0..30 {
+            assert_eq!(
+                mixes(&library, &["Tied"], 50),
+                first,
+                "the same library gave another mix"
+            );
+        }
+        let tied: Vec<&String> = first
+            .iter()
+            .flatten()
+            .filter(|id| id.starts_with('t'))
+            .collect();
+        let mut by_id = tied.clone();
+        by_id.sort();
+        assert_eq!(
+            tied, by_id,
+            "songs that tie must come in the order of their ids"
+        );
+        assert_eq!(tied[0], "t00");
     }
 
     /// Two recent artists (rock) and, among others, rock and jazz artists they never played.
@@ -917,7 +966,7 @@ mod tests {
         }
         let all = mixes_with_plays(&library, &["A", "C", "B"], &played);
         assert_eq!(all.len(), 2, "{all:?}");
-        let artists = |mix: &Vec<String>| -> HashSet<char> {
+        let artists = |mix: &Vec<String>| -> BTreeSet<char> {
             mix.iter().map(|id| id.chars().next().unwrap()).collect()
         };
         assert_eq!(artists(&all[0]), ['A', 'B'].into(), "{all:?}");
@@ -957,7 +1006,7 @@ mod tests {
         library.push(library[0].clone()); // the same id twice
         let all = mixes(&library, &["J1", "R1", "R2", "J2"], 50);
         let flat: Vec<&String> = all.iter().flatten().collect();
-        let unique: HashSet<&&String> = flat.iter().collect();
+        let unique: BTreeSet<&&String> = flat.iter().collect();
         assert_eq!(flat.len(), unique.len(), "{all:?}");
     }
 
@@ -1044,7 +1093,7 @@ mod tests {
     #[test]
     fn an_artist_that_is_heard_alone_most_of_the_time_is_not_close() {
         // Artist 0 is the group. Artist 1 shares one of its four sittings; artist 2 is only ever heard beside it.
-        let sittings: Vec<HashSet<usize>> =
+        let sittings: Vec<BTreeSet<usize>> =
             vec![[0, 1, 2].into(), [1].into(), [1].into(), [1].into()];
         let score = co_listening(&sittings, &[0]);
         assert!((score[&1] - 0.5).abs() < 1e-9, "1 / sqrt(1 * 4): {score:?}");
