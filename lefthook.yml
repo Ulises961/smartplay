@@ -57,6 +57,8 @@ local-verify:
   commands:
     fetch-deps:
       run: test -d .deps/pdk || ./scripts/fetch-deps.sh
+    version:
+      run: ./scripts/check-version.sh
     fmt:
       run: PATH="$HOME/.cargo/bin:$PATH" rustfmt --edition 2021 --check $(git ls-files 'crates/**/*.rs')
     clippy:
