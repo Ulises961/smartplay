@@ -28,6 +28,10 @@ only call the hosts its manifest lists, so before building the plugin put that n
 `crates/plugin/manifest.json`, under `permissions.http.requiredHosts` (for a network of `172.22.0.0/16`:
 `"requiredHosts": ["172.22.0.0/16"]`). Read the range with `docker network inspect NETWORK --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'`.
 
+The range is what authorizes the engine: Navidrome never lets a host name authorize a private address on its own, but it
+checks the address the name resolves to when the connection opens. So the plugin can call the engine by its name (step 4),
+and a recreated container keeps working as long as it stays in that range.
+
 ## 2. The engine
 
 ```bash
@@ -36,10 +40,10 @@ mkdir -p smartplay/state
 chmod 755 smartplay/smartplay-engine
 docker compose up -d smartplay-engine
 docker logs smartplay-engine          # a box with a one-time code (15 minutes); it is repeated on each start until enrolled
-docker inspect smartplay-engine --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'   # the engine's address
 ```
 
-That address can change when the stack is recreated: the plugin's setting follows it (step 4).
+The engine's address on the stack is its name, `smartplay-engine` (the `container_name` of the compose file): Docker resolves
+it to the engine's current IP on the network, so it does not change when the container is recreated.
 
 ## 3. The plugin
 
@@ -60,7 +64,8 @@ and grants nothing.
 
 ## 4. Enroll
 
-In Navidrome, the plugin's settings: engine address `http://ENGINE_IP:7788` (the address above) and the code from the engine's log. Within a
+In Navidrome, the plugin's settings: engine address `http://smartplay-engine:7788` and the code from the engine's log. Use the name, not an IP: an IP set here
+goes stale when the engine container is recreated, and the plugin then logs `connection refused` on every run. Within a
 minute the plugin sends the library, and `docker logs smartplay-engine` and Navidrome's log say so. The playlists `smartplay`
 and `smartplay: mix 1`/`2` appear for the granted user once there is something to put in them.
 
