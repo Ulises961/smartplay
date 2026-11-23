@@ -1,0 +1,5 @@
+.git
+target
+.deps
+dist
+.claude
