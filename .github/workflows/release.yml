@@ -1,0 +1,42 @@
+name: release
+
+# A tag `vX.Y.Z` publishes that version: the engine image to the GitHub Container Registry, and the plugin package
+# (`smartplay.ndp`) as a file of the release. One build serves every stack: the range of a stack's network is added to
+# the package when it is installed (deploy/README.md), not here.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the release
+  packages: write   # push the image
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - run: ./scripts/fetch-deps.sh
+      - name: Test
+        run: cargo test -p smartplay-core -p smartplay-engine
+      - name: Package the plugin
+        run: |
+          cargo build -p smartplay-plugin --release --target wasm32-wasip1
+          cp target/wasm32-wasip1/release/smartplay_plugin.wasm plugin.wasm
+          zip -j smartplay.ndp crates/plugin/manifest.json plugin.wasm
+      - name: Build and push the engine image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-engine"   # the registry wants lower case
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t "$IMAGE:$VERSION" .
+          docker push "$IMAGE:$VERSION"
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" smartplay.ndp --title "$GITHUB_REF_NAME" --generate-notes
