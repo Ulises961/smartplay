@@ -91,8 +91,9 @@ docker compose restart navidrome             # the running server learns of chan
 docker exec navidrome /app/navidrome plugin info smartplay                     # the user must be listed
 ```
 
-The id of a user is in the address of their page in Navidrome's admin pages. A user's name granted by mistake is accepted
-and grants nothing. Replacing the `.ndp` later leaves the plugin disabled: enable it again and restart Navidrome.
+The id of a user is in the address of their page in Navidrome's admin pages. `plugin edit --help` says "usernames", but on
+0.64.2 only ids work: a user's name is accepted and grants nothing (tried, see `FINDINGS.md`). Replacing the `.ndp` later
+leaves the plugin disabled: enable it again and restart Navidrome.
 
 ## 4. Enroll
 

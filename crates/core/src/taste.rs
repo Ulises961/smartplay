@@ -131,13 +131,13 @@ pub fn more_of_what_you_star(
                 .map_or(0, |a| picked_from.get(&a).copied().unwrap_or(0));
             c.score as f64 / (1 + taken) as f64
         };
-        let best = (0..candidates.len())
-            .max_by(|&x, &y| {
-                weight(&candidates[x])
-                    .total_cmp(&weight(&candidates[y]))
-                    .then_with(|| candidates[y].id.cmp(candidates[x].id))
-            })
-            .expect("candidates is not empty");
+        let Some(best) = (0..candidates.len()).max_by(|&x, &y| {
+            weight(&candidates[x])
+                .total_cmp(&weight(&candidates[y]))
+                .then_with(|| candidates[y].id.cmp(candidates[x].id))
+        }) else {
+            break; // the loop only runs while there are candidates, so this is not reached
+        };
         let chosen = candidates.swap_remove(best);
         if let Some(a) = chosen.artist {
             *picked_from.entry(a).or_default() += 1;

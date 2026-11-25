@@ -74,7 +74,7 @@ fn engine_token(base: &str) -> Result<Option<String>, String> {
     else {
         return Ok(None);
     };
-    let body = serde_json::to_string(&EnrollRequest { code }).unwrap();
+    let body = serde_json::to_string(&EnrollRequest { code }).map_err(|e| e.to_string())?;
     let (status, reply) = post(base, "/enroll", None, &body)?;
     if status != 200 {
         return Err(format!("enrollment refused ({status}): {reply}"));
@@ -133,7 +133,7 @@ fn ask(base: &str, token: &str, request: &ComputeRequest) -> Result<ComputeRespo
         base,
         "/compute",
         token,
-        &serde_json::to_string(request).unwrap(),
+        &serde_json::to_string(request).map_err(|e| e.to_string())?,
     )?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
 }
@@ -154,7 +154,7 @@ fn upload_library(base: &str, token: &str, user: &str, fingerprint: &str) -> Res
             base,
             "/library",
             token,
-            &serde_json::to_string(&chunk).unwrap(),
+            &serde_json::to_string(&chunk).map_err(|e| e.to_string())?,
         )?;
         sent += chunk.songs.len();
         if chunk.last {
@@ -273,23 +273,22 @@ impl Scrobbler for Smartplay {
             user: req.username.clone(),
             play,
         };
-        engine_post(
-            &base,
-            "/play",
-            &token,
-            &serde_json::to_string(&report).unwrap(),
-        )
-        .map(|_| ())
-        .map_err(|e| {
-            warn!("smartplay: {}: play not delivered: {e}", req.username);
-            match e {
-                EngineError::Rejected => ScrobbleError::new(SCROBBLER_ERROR_NOT_AUTHORIZED),
-                EngineError::Refused(status) if (400..500).contains(&status) => {
-                    ScrobbleError::new(SCROBBLER_ERROR_UNRECOVERABLE)
+        let Ok(body) = serde_json::to_string(&report) else {
+            // A play that cannot be written down will not be any better the next time: do not ask for it to be sent again.
+            return Err(ScrobbleError::new(SCROBBLER_ERROR_UNRECOVERABLE));
+        };
+        engine_post(&base, "/play", &token, &body)
+            .map(|_| ())
+            .map_err(|e| {
+                warn!("smartplay: {}: play not delivered: {e}", req.username);
+                match e {
+                    EngineError::Rejected => ScrobbleError::new(SCROBBLER_ERROR_NOT_AUTHORIZED),
+                    EngineError::Refused(status) if (400..500).contains(&status) => {
+                        ScrobbleError::new(SCROBBLER_ERROR_UNRECOVERABLE)
+                    }
+                    _ => retry_later(),
                 }
-                _ => retry_later(),
-            }
-        })
+            })
     }
 }
 
