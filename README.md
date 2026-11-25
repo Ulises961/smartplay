@@ -87,9 +87,10 @@ Star songs in any Subsonic client. Within a minute each granted user finds a pla
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
 Play some songs and each user also finds up to two playlists, `smartplay: mix 1` and `smartplay: mix 2`, built from the
-artists they played last: about 60% songs of those artists and 40% songs of other artists whose genres and moods are
-close to them. When the songs carry tags, the artists are split between the two mixes by how alike they are. They work
-for a user who has starred nothing, and they are ordinary playlists too.
+artists they played last: about 60% songs of those artists and 40% songs of other artists. Those are the ones whose
+genres and moods are close, and the ones the user tends to play in the same sitting (plays less than an hour apart) as
+the artists of the mix. When the songs carry tags, the artists are split between the two mixes by how alike they are.
+They work for a user who has starred nothing, and they are ordinary playlists too.
 
 The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what was played
 a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps only the latest 500 plays of each user, with the song, its artists and the time: enough to

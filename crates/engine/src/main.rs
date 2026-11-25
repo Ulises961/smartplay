@@ -486,25 +486,28 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     // What the engine saw played comes first, then the artists of the albums the server lists as
                     // recent: they cover the time before the engine was told about plays. An artist named in both
                     // takes one place, so the albums fill what the plays leave free.
+                    let played = store.plays(&server.name, &req.user);
                     let mut seen = HashSet::new();
-                    let recent: Vec<String> = plays::recent_artists(
-                        &store.plays(&server.name, &req.user),
-                        RECENT_ARTISTS,
+                    let recent: Vec<String> = plays::recent_artists(&played, RECENT_ARTISTS)
+                        .into_iter()
+                        .chain(req.recent.iter().cloned())
+                        .filter(|a| seen.insert(fold(a)))
+                        .take(RECENT_ARTISTS)
+                        .collect();
+                    let mixes = mix::recent_artist_mixes(
+                        &copy.songs,
+                        &recent,
+                        &played,
+                        &decisions,
+                        MIX_SIZE,
                     )
                     .into_iter()
-                    .chain(req.recent.iter().cloned())
-                    .filter(|a| seen.insert(fold(a)))
-                    .take(RECENT_ARTISTS)
+                    .enumerate()
+                    .map(|(i, songs)| Mix {
+                        playlist: format!("{MIX_PLAYLIST} {}", i + 1),
+                        songs,
+                    })
                     .collect();
-                    let mixes =
-                        mix::recent_artist_mixes(&copy.songs, &recent, &decisions, MIX_SIZE)
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, songs)| Mix {
-                                playlist: format!("{MIX_PLAYLIST} {}", i + 1),
-                                songs,
-                            })
-                            .collect();
                     ComputeResponse::Playlist {
                         playlist: PLAYLIST.into(),
                         songs: taste::more_of_what_you_star(
@@ -730,6 +733,36 @@ mod tests {
         );
         store.forget_data("home");
         assert!(!path.with_extension("bad").exists());
+    }
+
+    #[test]
+    fn an_artist_played_beside_a_recent_one_joins_the_mix_though_it_is_not_recent() {
+        let store = paired("co-listening");
+        // No tags anywhere: only what was played together can bring a song into the similar part.
+        let mut songs = vec![song("old1", "Old Friend"), song("hermit1", "Hermit")];
+        for i in 0..19 {
+            songs.push(song(&format!("r{i}"), &format!("R{i}")));
+        }
+        songs.push(song("f1", "Friend"));
+        upload(&store, "1@x", &[songs]);
+        let day = 24 * 3600;
+        report_play(&store, "ana", "hermit1", "Hermit", day); // alone
+        report_play(&store, "ana", "old1", "Old Friend", 2 * day); // one sitting with Friend
+        report_play(&store, "ana", "f1", "Friend", 2 * day + 60);
+        for i in 0..19 {
+            report_play(
+                &store,
+                "ana",
+                &format!("r{i}"),
+                &format!("R{i}"),
+                (3 + i) * day,
+            );
+        }
+        report_play(&store, "ana", "f1", "Friend", 30 * day); // Friend is recent again; Old Friend is the 21st artist
+        let mixes = mix_songs(compute_recent(&store, "1@x", &[]));
+        let flat: Vec<&String> = mixes.iter().flatten().collect();
+        assert!(flat.iter().any(|id| *id == "old1"), "{mixes:?}");
+        assert!(!flat.iter().any(|id| *id == "hermit1"), "{mixes:?}");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! Each mix is built on those artists (the base, 60%) and widened with songs by other artists whose tags are close to
 //! the base (the similar part, 40%). Tags are the genres and moods of the songs; a tag shared by few songs of the
-//! library says more than one shared by most of them, so rare tags weigh more.
+//! library says more than one shared by most of them, so rare tags weigh more. What the user played together says
+//! more still: an artist heard in the same sittings as the base artists is close to them, whatever its tags.
 //!
 //! Pure functions over a snapshot of the library, like `taste`: nothing is read from a server and nothing is kept.
 
@@ -10,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::identity::{resolve, Decisions, Track};
 use crate::normalize::fold;
+use crate::plays::{self, Play};
 use crate::taste::Song;
 
 /// Of every [`ROUND`] songs of a mix, this many come from the artists played and the rest are similar songs: 60%.
@@ -18,6 +20,10 @@ const ROUND: usize = 5;
 /// A mix is not worth making from fewer artists than this, so fewer than twice as many recent artists give one mix.
 const MIN_ARTISTS_PER_MIX: usize = 2;
 
+/// How much an artist played in the same sittings as the base adds to the score of its songs, next to the tags' cosine
+/// (both lie between 0 and 1).
+const CO_LISTENING_WEIGHT: f64 = 1.0;
+
 type Profile = HashMap<String, f64>;
 
 /// At most two mixes of up to `size` songs each, built from `recent` (artist names, most recent first).
@@ -25,9 +31,13 @@ type Profile = HashMap<String, f64>;
 /// The recent artists are told apart by identity, not spelling. They are split in two groups by how close their tags
 /// are (or in halves by recency when the songs carry no tags), and each group gets its own mix. A song is in at most one
 /// mix. When a mix cannot fill one of its two parts, the other part fills the gap; a mix with no songs is left out.
+///
+/// `played` is the user's tail of plays, in time order: the artists heard in the same sittings as a mix's base artists
+/// make its similar songs likelier. It may be empty.
 pub fn recent_artist_mixes(
     library: &[Song],
     recent: &[String],
+    played: &[Play],
     decisions: &Decisions,
     size: usize,
 ) -> Vec<Vec<String>> {
@@ -78,6 +88,18 @@ pub fn recent_artist_mixes(
         }
     }
 
+    // The artists of the library heard in each sitting (the main artist of each play).
+    let sittings: Vec<HashSet<usize>> = plays::sessions(played)
+        .iter()
+        .map(|sitting| {
+            sitting
+                .iter()
+                .filter_map(|p| p.artists.iter().map(|a| a.trim()).find(|a| !a.is_empty()))
+                .filter_map(artist)
+                .collect()
+        })
+        .collect();
+
     let mut used: HashSet<&str> = HashSet::new();
     let mut mixes = vec![];
     for group in split(&recent_artists, &profiles) {
@@ -87,6 +109,7 @@ pub fn recent_artist_mixes(
                 *profile.entry(t.clone()).or_default() += v;
             }
         }
+        let together = co_listening(&sittings, &group);
         let rank = |a: usize| recent_artists.iter().position(|&r| r == a).unwrap_or(0);
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -104,7 +127,9 @@ pub fn recent_artist_mixes(
                 }),
                 Some(a) if recent_artists.contains(a) => {}
                 _ => {
-                    let score = cosine(song_tags, &weight, &profile);
+                    let score = cosine(song_tags, &weight, &profile)
+                        + CO_LISTENING_WEIGHT
+                            * a.and_then(|a| together.get(&a)).copied().unwrap_or(0.0);
                     if score > 0.0 {
                         similar.push(Candidate {
                             id: &song.id,
@@ -135,6 +160,29 @@ pub fn recent_artist_mixes(
         }
     }
     mixes
+}
+
+/// How often each other artist was heard in the sittings of `group`, between 0 and 1: the sittings holding both, over
+/// the geometric mean of the sittings holding the group and those holding the artist. An artist always heard alone
+/// scores 0, and one the group's artists are heard with every time scores 1.
+fn co_listening(sittings: &[HashSet<usize>], group: &[usize]) -> HashMap<usize, f64> {
+    let with_group = |s: &&HashSet<usize>| group.iter().any(|a| s.contains(a));
+    let group_sittings = sittings.iter().filter(with_group).count();
+    let mut both: HashMap<usize, usize> = HashMap::new();
+    for sitting in sittings.iter().filter(with_group) {
+        for &other in sitting.iter().filter(|o| !group.contains(o)) {
+            *both.entry(other).or_default() += 1;
+        }
+    }
+    both.into_iter()
+        .map(|(other, n)| {
+            let of_other = sittings.iter().filter(|s| s.contains(&other)).count();
+            (
+                other,
+                n as f64 / ((group_sittings * of_other) as f64).sqrt(),
+            )
+        })
+        .collect()
 }
 
 /// The genres (every one the song has) and the moods of a song, folded. A mood and a genre of the same name are two tags.
@@ -310,7 +358,7 @@ mod tests {
     }
 
     fn mixes(library: &[Song], recent: &[&str], size: usize) -> Vec<Vec<String>> {
-        recent_artist_mixes(library, &names(recent), &Decisions::default(), size)
+        recent_artist_mixes(library, &names(recent), &[], &Decisions::default(), size)
     }
 
     /// Two recent artists (rock) and, among others, rock and jazz artists they never played.
@@ -435,6 +483,7 @@ mod tests {
         let mix = recent_artist_mixes(
             &library,
             &names(&["Los Redonditos de Ricota"]),
+            &[],
             &decisions,
             5,
         );
@@ -504,6 +553,114 @@ mod tests {
         let mut backward = library.clone();
         backward.reverse();
         assert_eq!(mixes(&library, &recent, 7), mixes(&backward, &recent, 7));
+    }
+
+    /// A play of the first song of `artist` (as `sample()` ids them) at `at` seconds.
+    fn heard(artist: &str, at: i64) -> Play {
+        Play {
+            song: format!("{artist}-heard"),
+            artists: vec![artist.into()],
+            at,
+        }
+    }
+
+    fn mixes_with_plays(library: &[Song], recent: &[&str], played: &[Play]) -> Vec<Vec<String>> {
+        recent_artist_mixes(library, &names(recent), played, &Decisions::default(), 50)
+    }
+
+    #[test]
+    fn an_artist_heard_in_the_same_sittings_leads_the_similar_songs_even_without_tags() {
+        // Neither candidate shares a tag with Band A, so tags alone choose nothing; the one heard beside it is chosen.
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("n1", "Neighbour", &["Jazz"], &[]),
+            song("s1", "Stranger", &["Folk"], &[]),
+        ];
+        assert_eq!(
+            mixes(&library, &["Band A"], 5)[0],
+            ["a1"],
+            "no tags in common"
+        );
+        let played = [
+            heard("Band A", 0),
+            heard("Neighbour", 300),
+            heard("Stranger", 100 * 3600),
+            heard("Band A", 200 * 3600),
+        ];
+        assert_eq!(
+            mixes_with_plays(&library, &["Band A"], &played)[0],
+            ["a1", "n1"],
+            "Stranger was heard in another sitting"
+        );
+    }
+
+    #[test]
+    fn co_listening_orders_artists_by_how_often_they_were_heard_together() {
+        let library = vec![
+            song("a1", "Band A", &[], &[]),
+            song("o1", "Often", &[], &[]),
+            song("e1", "Once", &[], &[]),
+        ];
+        // Often shares three of Band A's three sittings; Once shares one.
+        let mut played = vec![];
+        for (i, other) in [("Often", "Once"), ("Often", "Nobody"), ("Often", "Nobody")]
+            .iter()
+            .enumerate()
+        {
+            let t = i as i64 * 10 * 3600;
+            played.extend([heard("Band A", t), heard(other.0, t + 60)]);
+            if i == 0 {
+                played.push(heard(other.1, t + 120));
+            }
+        }
+        let mix = &mixes_with_plays(&library, &["Band A"], &played)[0];
+        assert_eq!(mix, &["a1", "o1", "e1"], "{mix:?}");
+    }
+
+    #[test]
+    fn an_artist_that_is_heard_alone_most_of_the_time_is_not_close() {
+        // Artist 0 is the group. Artist 1 shares one of its four sittings; artist 2 is only ever heard beside it.
+        let sittings: Vec<HashSet<usize>> =
+            vec![[0, 1, 2].into(), [1].into(), [1].into(), [1].into()];
+        let score = co_listening(&sittings, &[0]);
+        assert!((score[&1] - 0.5).abs() < 1e-9, "1 / sqrt(1 * 4): {score:?}");
+        assert!((score[&2] - 1.0).abs() < 1e-9, "1 / sqrt(1 * 1): {score:?}");
+        assert!(
+            !score.contains_key(&0),
+            "the group is not its own neighbour"
+        );
+    }
+
+    #[test]
+    fn plays_of_artists_that_are_not_in_the_library_change_nothing() {
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("r1", "R", &["Rock"], &[]),
+        ];
+        let played = [heard("Band A", 0), heard("Ghost", 60)];
+        assert_eq!(
+            mixes_with_plays(&library, &["Band A"], &played),
+            mixes(&library, &["Band A"], 50)
+        );
+    }
+
+    #[test]
+    fn co_listening_adds_to_the_tags_and_does_not_replace_them() {
+        // Both candidates are heard once beside Band A; the one that also shares a tag comes first.
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("n1", "Neighbour", &["Jazz"], &[]),
+            song("t1", "Tagged", &["Rock"], &[]),
+        ];
+        let played = [
+            heard("Band A", 0),
+            heard("Neighbour", 60),
+            heard("Tagged", 120),
+        ];
+        assert_eq!(
+            mixes_with_plays(&library, &["Band A"], &played)[0],
+            ["a1", "t1", "n1"]
+        );
     }
 
     #[test]

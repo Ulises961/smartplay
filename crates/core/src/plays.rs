@@ -73,6 +73,26 @@ pub fn recent_artists(log: &[Play], limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// Plays further apart than this (their start times) are not part of one sitting. An hour allows for a long track.
+pub const SESSION_GAP: i64 = 60 * 60;
+
+/// The plays cut into sittings: a new one starts when a play begins more than [`SESSION_GAP`] after the one before.
+/// `log` is in time order, as [`record`] keeps it.
+pub fn sessions(log: &[Play]) -> Vec<&[Play]> {
+    let mut sittings = vec![];
+    let mut start = 0;
+    for i in 1..log.len() {
+        if log[i].at - log[i - 1].at > SESSION_GAP {
+            sittings.push(&log[start..i]);
+            start = i;
+        }
+    }
+    if !log.is_empty() {
+        sittings.push(&log[start..]);
+    }
+    sittings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +176,24 @@ mod tests {
         );
         assert_eq!(recent_artists(&log, 2), ["Band C", "band  a"]);
         assert!(recent_artists(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn plays_are_cut_into_sittings_where_the_gap_is_long() {
+        let at = |s: &str, t: i64| play(s, "A", t);
+        let log = [
+            at("s1", 0),
+            at("s2", SESSION_GAP), // exactly the gap: still the same sitting
+            at("s3", 2 * SESSION_GAP + 1),
+            at("s4", 2 * SESSION_GAP + 2),
+            at("s5", 10 * SESSION_GAP),
+        ];
+        let sittings: Vec<Vec<&str>> = sessions(&log)
+            .iter()
+            .map(|s| s.iter().map(|p| p.song.as_str()).collect())
+            .collect();
+        assert_eq!(sittings, [vec!["s1", "s2"], vec!["s3", "s4"], vec!["s5"]]);
+        assert!(sessions(&[]).is_empty());
     }
 
     #[test]
