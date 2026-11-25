@@ -102,6 +102,30 @@ struct Raw {
     genres: Vec<GenreName>,
     #[serde(default)]
     moods: Vec<String>,
+    #[serde(default, deserialize_with = "number")]
+    year: Option<u32>,
+    #[serde(default, deserialize_with = "number")]
+    duration: Option<u32>,
+    #[serde(default, deserialize_with = "number")]
+    bpm: Option<u32>,
+    #[serde(default)]
+    created: Option<String>,
+    #[serde(default, rename = "playCount", deserialize_with = "number")]
+    play_count: Option<u32>,
+    #[serde(default)]
+    played: Option<String>,
+}
+
+/// A number the server gives as a number or as text; anything else, or a zero, is no number. One odd value must not
+/// make the whole page unreadable.
+fn number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let n = match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    Ok(n.filter(|&n| n > 0).and_then(|n| u32::try_from(n).ok()))
 }
 
 #[derive(Deserialize)]
@@ -172,12 +196,17 @@ pub fn fingerprint(api: &dyn Subsonic, user: &str) -> Result<String, String> {
                 .map(|g| format!("g\t{}\t{}", g.value, g.song_count)),
         )
         .collect();
+    // What a song carries changed: a library copied under an older reading is read again, once.
+    lines.push(format!("v\t{SONG_FIELDS}"));
     lines.sort();
     Ok(format!(
         "{count}-{:016x}",
         fnv1a(lines.join("\n").as_bytes())
     ))
 }
+
+/// Which fields of a song are read; raised whenever one is added, so that copies of a library made before it are replaced.
+const SONG_FIELDS: u32 = 2;
 
 /// FNV-1a: a small, dependency-free hash. It only has to tell two libraries apart, not resist anyone.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -205,6 +234,12 @@ pub fn songs(api: &dyn Subsonic, user: &str, offset: usize) -> Result<Vec<Song>,
             artist_mbid: None,
             genres: non_empty(s.genres.into_iter().map(|g| g.name)),
             moods: non_empty(s.moods),
+            year: s.year.and_then(|y| u16::try_from(y).ok()),
+            duration: s.duration,
+            bpm: s.bpm.and_then(|b| u16::try_from(b).ok()),
+            created: s.created.filter(|c| !c.trim().is_empty()),
+            play_count: s.play_count,
+            last_played: s.played.filter(|c| !c.trim().is_empty()),
         })
         .collect())
 }
@@ -339,6 +374,52 @@ mod tests {
         assert_eq!(found[0].genres, vec!["Rock", "Indie"]);
         assert_eq!(found[0].moods, vec!["Calm"]);
         assert!(found[1].genres.is_empty() && found[1].moods.is_empty());
+    }
+
+    #[test]
+    fn year_length_tempo_and_date_added_are_read_and_an_odd_value_is_only_missing() {
+        struct Fields;
+        impl Subsonic for Fields {
+            fn call(&self, _: &str) -> Result<String, String> {
+                Ok(
+                    r#"{"subsonic-response":{"status":"ok","searchResult3":{"song":[
+                    {"id":"a","year":1994,"duration":215,"bpm":120,"created":"2026-10-30T10:00:00Z",
+                     "playCount":3,"played":"2026-11-20T08:33:59.586723049Z"},
+                    {"id":"b","year":"1994","duration":0,"bpm":"fast","created":" "},
+                    {"id":"c","year":-3,"duration":1e12,"bpm":null}]}}}"#
+                        .into(),
+                )
+            }
+        }
+        let found = songs(&Fields, "me", 0).unwrap();
+        assert_eq!(
+            (found[0].year, found[0].duration, found[0].bpm),
+            (Some(1994), Some(215), Some(120))
+        );
+        assert_eq!(found[0].created.as_deref(), Some("2026-10-30T10:00:00Z"));
+        assert_eq!(found[0].play_count, Some(3));
+        assert_eq!(
+            found[0].last_played.as_deref(),
+            Some("2026-11-20T08:33:59.586723049Z")
+        );
+        assert_eq!(
+            found[1].play_count, None,
+            "a song never played has no count"
+        );
+        assert_eq!(
+            (
+                found[1].year,
+                found[1].duration,
+                found[1].bpm,
+                &found[1].created
+            ),
+            (Some(1994), None, None, &None),
+            "text that is a number counts; zero, words and blanks do not"
+        );
+        assert_eq!(
+            (found[2].year, found[2].duration, found[2].bpm),
+            (None, None, None)
+        );
     }
 
     struct Recent(&'static str);

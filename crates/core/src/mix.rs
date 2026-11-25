@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::enrich::Enrichment;
 use crate::identity::{resolve, Decisions, Track};
 use crate::normalize::fold;
 use crate::plays::{self, Play};
@@ -24,6 +25,13 @@ const MIN_ARTISTS_PER_MIX: usize = 2;
 /// (both lie between 0 and 1).
 const CO_LISTENING_WEIGHT: f64 = 1.0;
 
+/// How much an artist that outside services call close to the base artists adds to the score of its songs, times how close
+/// they say it is (between 0 and 1).
+const SIMILAR_WEIGHT: f64 = 0.5;
+/// An artist's crowd tag counts as a tag of each of its songs when it is at least this strong (between 0 and 1): the weak
+/// ones describe a few listeners' habits and not the artist.
+const MIN_CROWD_TAG: f64 = 0.3;
+
 type Profile = HashMap<String, f64>;
 
 /// At most two mixes of up to `size` songs each, built from `recent` (artist names, most recent first).
@@ -32,13 +40,16 @@ type Profile = HashMap<String, f64>;
 /// are (or in halves by recency when the songs carry no tags), and each group gets its own mix. A song is in at most one
 /// mix. When a mix cannot fill one of its two parts, the other part fills the gap; a mix with no songs is left out.
 ///
-/// `played` is the user's tail of plays, in time order: the artists heard in the same sittings as a mix's base artists
-/// make its similar songs likelier. It may be empty.
+/// `played` is the user's history of plays, in time order: the artists heard in the same sittings as a mix's base artists
+/// make its similar songs likelier. It may be empty. So may `enrichment`, what outside services say of the artists: their
+/// crowd tags are added to the tags of their songs, and the artists they call close to a mix's base artists make its
+/// similar songs likelier.
 pub fn recent_artist_mixes(
     library: &[Song],
     recent: &[String],
     played: &[Play],
     decisions: &Decisions,
+    enrichment: &Enrichment,
     size: usize,
 ) -> Vec<Vec<String>> {
     if size == 0 {
@@ -53,8 +64,9 @@ pub fn recent_artist_mixes(
             artist_mbid: s.artist_mbid.clone(),
         })
         .collect();
+    let clusters = resolve(&tracks, decisions).clusters;
     let mut artist_of_name: HashMap<String, usize> = HashMap::new();
-    for (i, cluster) in resolve(&tracks, decisions).clusters.iter().enumerate() {
+    for (i, cluster) in clusters.iter().enumerate() {
         for spelling in &cluster.spellings {
             artist_of_name.insert(fold(spelling), i);
         }
@@ -71,7 +83,7 @@ pub fn recent_artist_mixes(
         return vec![];
     }
 
-    let tags: Vec<HashSet<String>> = library.iter().map(tags_of).collect();
+    let tags: Vec<HashSet<String>> = library.iter().map(|s| tags_of(s, enrichment)).collect();
     let weight = idf(&tags);
     let songs: Vec<(&Song, Option<usize>)> = library
         .iter()
@@ -110,6 +122,7 @@ pub fn recent_artist_mixes(
             }
         }
         let together = co_listening(&sittings, &group);
+        let close = close_artists(&group, &clusters, enrichment, &artist);
         let rank = |a: usize| recent_artists.iter().position(|&r| r == a).unwrap_or(0);
 
         let mut seen: HashSet<&str> = HashSet::new();
@@ -122,6 +135,7 @@ pub fn recent_artist_mixes(
                 Some(a) if group.contains(a) => base.push(Candidate {
                     id: &song.id,
                     artist: Some(*a),
+                    song: song_key(song),
                     // Between 1 and 2: the latest artist leads, but not by so much that it crowds the others out.
                     score: 1.0 + 1.0 / (1 + rank(*a)) as f64,
                 }),
@@ -129,11 +143,13 @@ pub fn recent_artist_mixes(
                 _ => {
                     let score = cosine(song_tags, &weight, &profile)
                         + CO_LISTENING_WEIGHT
-                            * a.and_then(|a| together.get(&a)).copied().unwrap_or(0.0);
+                            * a.and_then(|a| together.get(&a)).copied().unwrap_or(0.0)
+                        + SIMILAR_WEIGHT * a.and_then(|a| close.get(&a)).copied().unwrap_or(0.0);
                     if score > 0.0 {
                         similar.push(Candidate {
                             id: &song.id,
                             artist: *a,
+                            song: song_key(song),
                             score,
                         });
                     }
@@ -185,8 +201,32 @@ fn co_listening(sittings: &[HashSet<usize>], group: &[usize]) -> HashMap<usize, 
         .collect()
 }
 
-/// The genres (every one the song has) and the moods of a song, folded. A mood and a genre of the same name are two tags.
-fn tags_of(song: &Song) -> HashSet<String> {
+/// How close outside services say each artist is to the artists of `group`, between 0 and 1: the closest of them counts.
+fn close_artists(
+    group: &[usize],
+    clusters: &[crate::identity::Cluster],
+    enrichment: &Enrichment,
+    artist: &dyn Fn(&str) -> Option<usize>,
+) -> HashMap<usize, f64> {
+    let mut close: HashMap<usize, f64> = HashMap::new();
+    for &a in group {
+        let infos = clusters[a]
+            .spellings
+            .iter()
+            .filter_map(|s| enrichment.get(s));
+        for (name, matched) in infos.flat_map(|i| &i.similar) {
+            if let Some(other) = artist(name).filter(|o| !group.contains(o)) {
+                let best = close.entry(other).or_default();
+                *best = best.max(*matched);
+            }
+        }
+    }
+    close
+}
+
+/// The genres (every one the song has), the moods of a song and the crowd tags of its artist, folded. A mood and a genre
+/// of the same name are two tags, and so is a crowd tag (`l:`), which comes from another source.
+fn tags_of(song: &Song, enrichment: &Enrichment) -> HashSet<String> {
     let genres: Vec<&str> = if song.genres.is_empty() {
         song.genre.as_deref().into_iter().collect()
     } else {
@@ -194,8 +234,15 @@ fn tags_of(song: &Song) -> HashSet<String> {
     };
     let genres = genres.into_iter().map(|g| format!("g:{}", fold(g)));
     let moods = song.moods.iter().map(|m| format!("m:{}", fold(m)));
+    let crowd = enrichment
+        .get(&song.artist)
+        .into_iter()
+        .flat_map(|info| &info.tags)
+        .filter(|(_, weight)| *weight >= MIN_CROWD_TAG)
+        .map(|(tag, _)| format!("l:{tag}"));
     genres
         .chain(moods)
+        .chain(crowd)
         .filter(|t| t.len() > 2) // a tag that folds to nothing, such as "-", is no tag
         .collect()
 }
@@ -292,20 +339,41 @@ fn split(recent: &[usize], profiles: &HashMap<usize, Profile>) -> Vec<Vec<usize>
 struct Candidate<'a> {
     id: &'a str,
     artist: Option<usize>,
+    /// The song without what makes it a version of itself (see [`song_key`]): a demo and a live take of one song share it.
+    song: String,
     score: f64,
 }
 
+/// How much a version of a song already picked lowers the next: a second one counts for a fifth, a third for a ninth.
+const VARIANT_PENALTY: f64 = 4.0;
+
+/// The artist and title of a song, folded, without the part of the title after ` - ` or in brackets: `Tangled - Demo`,
+/// `Maps - Live In Manchester` and `Magic Dance (Remix)` are versions of `Tangled`, `Maps` and `Magic Dance`. They stay
+/// different songs; this only tells a mix not to fill itself with the variants of one.
+fn song_key(song: &Song) -> String {
+    let title = song.title.as_str();
+    let end = [" - ", " (", " ["]
+        .iter()
+        .filter_map(|cut| title.find(cut))
+        .min()
+        .unwrap_or(title.len());
+    format!("{}\u{1}{}", fold(&song.artist), fold(&title[..end]))
+}
+
 /// Up to `limit` ids, best first. Each pick lowers the next song of the same artist (its score is divided by one plus
-/// the songs already picked from that artist), so the list mixes artists instead of playing one out.
+/// the songs already picked from that artist), so the list mixes artists instead of playing one out, and lowers the versions
+/// of the same song much more, so that a demo, a live take and a remix of one song do not fill it.
 fn pick(mut candidates: Vec<Candidate>, limit: usize) -> Vec<String> {
     let mut picked_from: HashMap<usize, usize> = HashMap::new();
+    let mut picked_versions: HashMap<String, usize> = HashMap::new();
     let mut list = vec![];
     while list.len() < limit && !candidates.is_empty() {
         let weight = |c: &Candidate| {
             let taken = c
                 .artist
                 .map_or(0, |a| picked_from.get(&a).copied().unwrap_or(0));
-            c.score / (1 + taken) as f64
+            let versions = picked_versions.get(&c.song).copied().unwrap_or(0);
+            c.score / (1 + taken) as f64 / (1.0 + VARIANT_PENALTY * versions as f64)
         };
         let best = (0..candidates.len())
             .max_by(|&x, &y| {
@@ -318,6 +386,7 @@ fn pick(mut candidates: Vec<Candidate>, limit: usize) -> Vec<String> {
         if let Some(a) = chosen.artist {
             *picked_from.entry(a).or_default() += 1;
         }
+        *picked_versions.entry(chosen.song.clone()).or_default() += 1;
         list.push(chosen.id.to_string());
     }
     list
@@ -358,7 +427,14 @@ mod tests {
     }
 
     fn mixes(library: &[Song], recent: &[&str], size: usize) -> Vec<Vec<String>> {
-        recent_artist_mixes(library, &names(recent), &[], &Decisions::default(), size)
+        recent_artist_mixes(
+            library,
+            &names(recent),
+            &[],
+            &Decisions::default(),
+            &Enrichment::default(),
+            size,
+        )
     }
 
     /// Two recent artists (rock) and, among others, rock and jazz artists they never played.
@@ -485,6 +561,7 @@ mod tests {
             &names(&["Los Redonditos de Ricota"]),
             &[],
             &decisions,
+            &Enrichment::default(),
             5,
         );
         assert_eq!(mix[0].len(), 2, "{mix:?}");
@@ -561,11 +638,19 @@ mod tests {
             song: format!("{artist}-heard"),
             artists: vec![artist.into()],
             at,
+            ..Play::default()
         }
     }
 
     fn mixes_with_plays(library: &[Song], recent: &[&str], played: &[Play]) -> Vec<Vec<String>> {
-        recent_artist_mixes(library, &names(recent), played, &Decisions::default(), 50)
+        recent_artist_mixes(
+            library,
+            &names(recent),
+            played,
+            &Decisions::default(),
+            &Enrichment::default(),
+            50,
+        )
     }
 
     #[test]
@@ -669,5 +754,136 @@ mod tests {
         old.genre = Some("Rock".into());
         let library = vec![song("a1", "Band A", &["Rock"], &[]), old];
         assert_eq!(mixes(&library, &["Band A"], 5)[0], ["a1", "old"]);
+    }
+
+    /// An artist, its crowd tags and its close artists.
+    type Entry<'a> = (&'a str, &'a [(&'a str, f64)], &'a [(&'a str, f64)]);
+
+    fn known(entries: &[Entry]) -> Enrichment {
+        use crate::enrich::ArtistInfo;
+        let mut known = Enrichment::default();
+        for (artist, tags, similar) in entries {
+            known.insert(
+                artist,
+                ArtistInfo {
+                    tags: tags.iter().map(|(t, w)| (t.to_string(), *w)).collect(),
+                    similar: similar.iter().map(|(a, m)| (a.to_string(), *m)).collect(),
+                },
+            );
+        }
+        known
+    }
+
+    fn mixes_enriched(library: &[Song], recent: &[&str], known: &Enrichment) -> Vec<Vec<String>> {
+        recent_artist_mixes(
+            library,
+            &names(recent),
+            &[],
+            &Decisions::default(),
+            known,
+            50,
+        )
+    }
+
+    #[test]
+    fn the_crowd_tags_of_an_artist_bring_its_songs_close_when_the_files_carry_no_tags() {
+        let library = vec![
+            song("a1", "Portishead", &[], &[]),
+            song("m1", "Massive Attack", &[], &[]),
+            song("r1", "Radiohead", &[], &[]),
+        ];
+        assert_eq!(
+            mixes(&library, &["Portishead"], 5)[0],
+            ["a1"],
+            "nothing to go by"
+        );
+        let known = known(&[
+            ("Portishead", &[("trip hop", 1.0)], &[]),
+            ("Massive Attack", &[("trip hop", 0.9)], &[]),
+            ("Radiohead", &[("rock", 1.0)], &[]),
+        ]);
+        assert_eq!(
+            mixes_enriched(&library, &["Portishead"], &known)[0],
+            ["a1", "m1"]
+        );
+    }
+
+    #[test]
+    fn a_weak_crowd_tag_is_not_a_tag_of_the_songs() {
+        let library = vec![
+            song("a1", "Portishead", &[], &[]),
+            song("b1", "British Band", &[], &[]),
+        ];
+        let known = known(&[
+            ("Portishead", &[("trip hop", 1.0), ("british", 0.1)], &[]),
+            ("British Band", &[("british", 1.0)], &[]),
+        ]);
+        assert_eq!(mixes_enriched(&library, &["Portishead"], &known)[0], ["a1"]);
+    }
+
+    #[test]
+    fn an_artist_the_services_call_close_makes_its_songs_likelier_whatever_its_tags() {
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("c1", "Close", &["Jazz"], &[]),
+            song("s1", "Stranger", &["Folk"], &[]),
+        ];
+        let known = known(&[("Band A", &[], &[("close", 0.8), ("Band A", 1.0)])]);
+        assert_eq!(
+            mixes_enriched(&library, &["Band A"], &known)[0],
+            ["a1", "c1"]
+        );
+    }
+
+    #[test]
+    fn what_the_services_say_adds_to_the_tags_and_does_not_replace_them() {
+        let library = vec![
+            song("a1", "Band A", &["Rock"], &[]),
+            song("c1", "Close", &["Jazz"], &[]),
+            song("t1", "Tagged", &["Rock"], &[]),
+        ];
+        let known = known(&[("Band A", &[], &[("Close", 0.4)])]);
+        // Tagged shares a tag (cosine 1); Close is only called close (0.5 * 0.4): Tagged comes first.
+        assert_eq!(
+            mixes_enriched(&library, &["Band A"], &known)[0],
+            ["a1", "t1", "c1"]
+        );
+    }
+
+    #[test]
+    fn the_versions_of_a_song_are_told_by_what_follows_its_title() {
+        let key = |title: &str| {
+            let mut s = song("x", "Maroon 5", &[], &[]);
+            s.title = title.into();
+            song_key(&s)
+        };
+        assert_eq!(key("Tangled - Demo"), key("Tangled"));
+        assert_eq!(key("Maps - Live In Manchester"), key("maps"));
+        assert_eq!(key("Magic Dance (Danny S Remix)"), key("Magic Dance"));
+        assert_ne!(key("Maps"), key("Tangled"));
+        assert_ne!(key("Maps"), {
+            let mut s = song("x", "Other Band", &[], &[]);
+            s.title = "Maps".into();
+            song_key(&s)
+        });
+    }
+
+    #[test]
+    fn a_mix_does_not_fill_itself_with_the_versions_of_one_song() {
+        let version = |id: &str, title: &str| {
+            let mut s = song(id, "Band A", &[], &[]);
+            s.title = title.into();
+            s
+        };
+        let library = vec![
+            version("m1", "Maps"),
+            version("m2", "Maps - Live"),
+            version("m3", "Maps - Demo"),
+            version("t1", "Tangled"),
+            version("s1", "Shiver"),
+        ];
+        // Equal scores: without the penalty the three versions of Maps would come first, in the order of their ids.
+        let mix = &mixes(&library, &["Band A"], 3)[0];
+        assert_eq!(mix, &["m1", "s1", "t1"], "{mix:?}");
     }
 }

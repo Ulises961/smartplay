@@ -263,9 +263,15 @@ impl Scrobbler for Smartplay {
             return Err(retry_later());
         };
         let credited: Vec<String> = req.track.artists.iter().map(|a| a.name.clone()).collect();
+        let mut play = Play::new(&req.track.id, &credited, &req.track.artist, req.timestamp);
+        play.title = req.track.title.clone();
+        play.album = req.track.album.clone();
+        // The server scrobbles a finished play: how much was heard is not told, but how long the song is, is.
+        play.track_ms = (req.track.duration > 0.0).then(|| (req.track.duration * 1000.0) as u64);
+        play.source = "scrobbler".into();
         let report = PlayReport {
             user: req.username.clone(),
-            play: Play::new(&req.track.id, &credited, &req.track.artist, req.timestamp),
+            play,
         };
         engine_post(
             &base,

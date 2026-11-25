@@ -10,9 +10,6 @@
         "engine_url": { "type": "string", "title": "Engine address", "description": "For example http://172.17.0.1:7788" },
         "enrollment_code": { "type": "string", "title": "Enrollment code", "description": "One-time code printed by the engine" }
       }
-    },
-    "uiSchema": {
-      "enrollment_code": { "ui:widget": "password" }
     }
   },
   "permissions": {

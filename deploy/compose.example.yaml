@@ -1,0 +1,22 @@
+# The engine as one more service of a Navidrome compose stack. Add it beside the `navidrome` service, in the same file.
+#
+# It joins the stack's own network and publishes no port, so nothing outside the stack can reach it. The plugin runs inside
+# Navidrome and reaches the engine by the engine's address on that network: the plugin's manifest must list the network's
+# range in `requiredHosts` (see README.md).
+services:
+  smartplay-engine:
+    image: debian:bookworm-slim
+    container_name: smartplay-engine
+    restart: unless-stopped
+    # The user that owns the folder of the engine's state (see README.md).
+    user: "1000:1000"
+    command: ["/opt/smartplay-engine", "serve", "--bind", "0.0.0.0:7788", "--data", "/state"]
+    volumes:
+      - "./smartplay/smartplay-engine:/opt/smartplay-engine:ro"
+      - "./smartplay/state:/state"
+    mem_limit: 128m
+    cpus: 0.5
+
+# And on the `navidrome` service, to let it load plugins:
+#   environment:
+#     ND_PLUGINS_ENABLED: "true"

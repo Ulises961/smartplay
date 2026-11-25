@@ -1,17 +1,19 @@
 //! Engine: registered servers, one-time enrollment codes, bearer tokens. Answers each granted user with a playlist.
 //! State is a JSON file so the `servers` commands (separate processes) and `serve` share it.
 
+mod eval;
+mod history;
+mod lastfm;
+
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
     mix,
-    normalize::fold,
     plays::{self, Play},
     protocol::*,
     taste,
 };
 use std::{
-    collections::HashSet,
     fs,
     io::{Read, Write},
     path::PathBuf,
@@ -25,8 +27,6 @@ const PLAYLIST_SIZE: usize = 50;
 /// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
 const MIX_PLAYLIST: &str = "smartplay: mix";
 const MIX_SIZE: usize = 50;
-/// Artists a mix starts from at most: the latest ones played, then the ones of the albums the server lists as recent.
-const RECENT_ARTISTS: usize = 20;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
 #[derive(Serialize, Deserialize)]
@@ -88,11 +88,12 @@ impl Store {
         if !chunk.last {
             return Ok(());
         }
-        let songs: Vec<taste::Song> = fs::read_to_string(&part)
+        let mut songs: Vec<taste::Song> = fs::read_to_string(&part)
             .map_err(|e| e.to_string())?
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
+        self.take_baseline(server, &chunk.user, &mut songs)?;
         let stored = StoredLibrary {
             fingerprint: chunk.fingerprint,
             songs,
@@ -102,6 +103,97 @@ impl Store {
         fs::rename(&done, self.library_path(server, &chunk.user, "json"))
             .map_err(|e| e.to_string())?;
         let _ = fs::remove_file(part);
+        Ok(())
+    }
+
+    fn lastfm_path(&self) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join("enrichment-lastfm.json")
+    }
+
+    /// What Last.fm said of artists, shared by every user (it is about artists, not about anyone); nothing when it was
+    /// never asked.
+    fn lastfm(&self) -> lastfm::Cache {
+        fs::read_to_string(self.lastfm_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_lastfm(&self, cache: &lastfm::Cache) -> Result<(), String> {
+        let path = self.lastfm_path();
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_string(cache).unwrap()).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    }
+
+    fn recent_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("recent-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// The artists of the albums the server last listed as recent for a user, as the plugin sent them: the engine cannot ask
+    /// the server itself, so it keeps the last list to show, in `eval`, the mixes the plugin gets.
+    fn recent(&self, server: &str, user: &str) -> Vec<String> {
+        fs::read_to_string(self.recent_path(server, user))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn keep_recent(&self, server: &str, user: &str, recent: &[String]) {
+        let path = self.recent_path(server, user);
+        if self.recent(server, user) != recent {
+            let _ = fs::write(path, serde_json::to_string(recent).unwrap());
+        }
+    }
+
+    fn baseline_path(&self, server: &str, user: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(format!("baseline-{}-{}.json", hex(server), hex(user)))
+    }
+
+    /// What the server counted as played before the engine heard of any play; none when it was never taken.
+    fn baseline(&self, server: &str, user: &str) -> Option<plays::Baseline> {
+        let text = fs::read_to_string(self.baseline_path(server, user)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Keeps the play counts of the first copy of a user's library as their baseline, once, and takes the counts out of
+    /// `songs`: they change with every play, and the history is where plays are kept from then on.
+    fn take_baseline(
+        &self,
+        server: &str,
+        user: &str,
+        songs: &mut [taste::Song],
+    ) -> Result<(), String> {
+        let path = self.baseline_path(server, user);
+        if !path.exists() {
+            let tallies: Vec<plays::Tally> = songs
+                .iter()
+                .filter_map(|s| {
+                    Some(plays::Tally {
+                        song: s.id.clone(),
+                        artist: s.artist.clone(),
+                        title: s.title.clone(),
+                        count: s.play_count.filter(|&c| c > 0)?,
+                        last_played: s.last_played.clone(),
+                    })
+                })
+                .collect();
+            let baseline = plays::Baseline {
+                at: now() as i64,
+                tallies,
+            };
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, serde_json::to_string(&baseline).unwrap())
+                .map_err(|e| e.to_string())?;
+            fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        }
+        for song in songs {
+            song.play_count = None;
+            song.last_played = None;
+        }
         Ok(())
     }
 
@@ -131,51 +223,59 @@ impl Store {
 
     fn plays_path(&self, server: &str, user: &str) -> PathBuf {
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
-        dir.join(format!("plays-{}-{}.json", hex(server), hex(user)))
+        dir.join(format!("plays-{}-{}.jsonl", hex(server), hex(user)))
     }
 
-    /// The tail of plays kept for a user, oldest first; empty when there is no file or it cannot be read.
+    fn play_log(&self, server: &str, user: &str) -> history::PlayLog {
+        history::PlayLog::new(self.plays_path(server, user))
+    }
+
+    /// The plays kept for a user, oldest first; empty when there are none.
     fn plays(&self, server: &str, user: &str) -> Vec<Play> {
-        fs::read_to_string(self.plays_path(server, user))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        self.play_log(server, user).load()
     }
 
-    /// Adds a play to the user's tail. Returns whether it was new.
+    /// Adds a play to the user's history and drops what is past the retention. Returns whether it was new.
     fn record_play(&self, server: &str, user: &str, play: Play) -> Result<bool, String> {
-        let path = self.plays_path(server, user);
-        let mut log = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                // Never write over a tail that cannot be read: keep it for the operator and start a new one.
-                let aside = path.with_extension("bad");
+        let log = self.play_log(server, user);
+        let new = log.append(&play)?;
+        if new {
+            // A failed rewrite loses nothing: the next play tries again.
+            if let Err(e) = log.compact(now() as i64, plays::RETENTION) {
                 eprintln!(
-                    "{}: unreadable ({e}); kept as {}",
-                    path.display(),
-                    aside.display()
+                    "{}: not compacted: {e}",
+                    self.plays_path(server, user).display()
                 );
-                let _ = fs::rename(&path, aside);
-                vec![]
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(e.to_string()),
-        };
-        if !plays::record(&mut log, play) {
-            return Ok(false);
+            }
         }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_string(&log).unwrap()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(new)
     }
 
     /// Deletes everything a server holds about its users: library copies, decisions and plays.
     fn forget_data(&self, server: &str) {
-        let prefixes = [
+        self.forget(&[
             format!("library-{}-", hex(server)),
             format!("decisions-{}-", hex(server)),
             format!("plays-{}-", hex(server)),
-        ];
+            format!("baseline-{}-", hex(server)),
+            format!("recent-{}-", hex(server)),
+        ]);
+    }
+
+    /// Deletes everything held about one user of a server: the library copy, the decisions and the history of plays.
+    fn forget_user(&self, server: &str, user: &str) {
+        let name = format!("{}-{}.", hex(server), hex(user));
+        self.forget(&[
+            format!("library-{name}"),
+            format!("decisions-{name}"),
+            format!("plays-{name}"),
+            format!("baseline-{name}"),
+            format!("recent-{name}"),
+        ]);
+    }
+
+    /// Deletes the files of the data folder whose names start with any of `prefixes`.
+    fn forget(&self, prefixes: &[String]) {
         let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -189,6 +289,40 @@ impl Store {
             }
         }
     }
+
+    /// Adds the plays told by the lines of an import file (see `plays::from_import_line`) to a user's history.
+    fn import_plays(&self, server: &str, user: &str, source: &str, text: &str) -> ImportReport {
+        let mut report = ImportReport::default();
+        let mut plays = vec![];
+        for (n, line) in text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+        {
+            match plays::from_import_line(line, source) {
+                Ok(play) => plays.push(play),
+                Err(e) => report.invalid.push((n + 1, e)),
+            }
+        }
+        report.read = plays.len();
+        match self.play_log(server, user).append_many(plays) {
+            Ok(added) => report.added = added,
+            Err(e) => report.failed = Some(e),
+        }
+        report
+    }
+}
+
+/// What an import did.
+#[derive(Default, Debug)]
+struct ImportReport {
+    /// Lines that were plays.
+    read: usize,
+    /// Of those, the ones that were new.
+    added: usize,
+    /// Lines that were not, by line number, and why.
+    invalid: Vec<(usize, String)>,
+    failed: Option<String>,
 }
 
 fn now() -> u64 {
@@ -246,27 +380,222 @@ fn main() {
         ),
         Some("servers") => servers_command(store, &args[1..]),
         Some("artists") => artists_command(store, &args[1..]),
+        Some("import") => import_command(store, &args[1..]),
+        Some("purge") => purge_command(store, &args[1..]),
+        Some("eval") => eval_command(store, &args[1..]),
+        Some("enrich") => enrich_command(store, &args[1..]),
+        Some("import-lastfm") => import_lastfm_command(store, &args[1..]),
         _ => eprintln!(
             "usage: smartplay-engine serve [--bind ADDR] [--data DIR] | servers add|list|remove NAME\n       \
-             smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER"
+             smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
+             smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
+             smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--data DIR]\n       \
+             smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
 }
 
-/// The words of a command, without the `--flag VALUE` pairs the engine itself takes.
+/// The words of a command, without its `--flag VALUE` pairs (every flag the engine has takes a value).
 fn positional(args: &[String]) -> Vec<&str> {
     let mut words = vec![];
     let mut skip = false;
     for a in args {
         if skip {
             skip = false;
-        } else if a == "--data" || a == "--bind" {
+        } else if a.starts_with("--") {
             skip = true;
         } else {
             words.push(a.as_str());
         }
     }
     words
+}
+
+/// Adds the plays of a file of JSON lines to a user's history (the lines are described at `plays::from_import_line`).
+/// A play already kept is not added again, so running an import twice adds nothing the second time.
+fn import_command(store: Store, args: &[String]) {
+    let source = args
+        .iter()
+        .position(|a| a == "--source")
+        .and_then(|i| args.get(i + 1))
+        .map_or("file", String::as_str);
+    let words = positional(args);
+    let [server, user, file] = words.as_slice() else {
+        eprintln!("usage: import SERVER USER FILE [--source NAME]");
+        return;
+    };
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) => return eprintln!("{file}: {e}"),
+    };
+    let report = store.import_plays(server, user, source, &text);
+    for (line, why) in report.invalid.iter().take(10) {
+        eprintln!("line {line}: {why}");
+    }
+    if report.invalid.len() > 10 {
+        eprintln!("... and {} more lines", report.invalid.len() - 10);
+    }
+    if let Some(e) = report.failed {
+        return eprintln!("the history could not be written: {e}");
+    }
+    println!(
+        "{} plays read, {} new, {} already kept, {} lines that are not plays",
+        report.read,
+        report.added,
+        report.read - report.added,
+        report.invalid.len()
+    );
+}
+
+/// Asks Last.fm for the tags and close artists of the artists of a user's library, the ones heard most first, and keeps the
+/// answers for every user. It is opt-in (it needs the key in `SMARTPLAY_LASTFM_KEY`) and sends nothing but artist names. A
+/// run asks for `--limit` artists at most (100 by default) and the next run goes on from there.
+fn enrich_command(store: Store, args: &[String]) {
+    let Some(key) = std::env::var("SMARTPLAY_LASTFM_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return eprintln!(
+            "Last.fm is asked only when you give a key: set SMARTPLAY_LASTFM_KEY (the names of the artists of the library are \
+             sent to Last.fm, and nothing else)"
+        );
+    };
+    let words = positional(args);
+    let [server, user] = words.as_slice() else {
+        return eprintln!("usage: enrich SERVER USER [--limit N]");
+    };
+    let Some(library) = store.library(server, user) else {
+        return eprintln!(
+            "the engine holds no library for {user} on {server}: run the plugin once"
+        );
+    };
+    let mut left = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100usize);
+    let order = lastfm::artists_to_ask(
+        &library.songs,
+        &store.plays(server, user),
+        store.baseline(server, user).as_ref(),
+    );
+    let client = lastfm::Client::new(key.trim());
+    let mut cache = store.lastfm();
+    let mut total = lastfm::Outcome::default();
+    // In steps, saving after each, so that a run that is cut short keeps what it has.
+    while left > 0 {
+        let step = lastfm::fill(&mut cache, &order, &client, left.min(10), now() as i64);
+        if let Err(e) = store.save_lastfm(&cache) {
+            return eprintln!("what Last.fm said could not be kept: {e}");
+        }
+        left -= step.asked;
+        total.asked += step.asked;
+        total.known += step.known;
+        total.unknown += step.unknown;
+        total.skipped += step.skipped;
+        if step.stopped.is_some() || step.asked == 0 {
+            total.stopped = step.stopped;
+            break;
+        }
+    }
+    println!(
+        "asked about {} artists: {} known, {} not known to Last.fm, {} left for later; {} artists have tags now",
+        total.asked,
+        total.known,
+        total.unknown,
+        total.skipped,
+        cache.known.len()
+    );
+    if let Some(why) = total.stopped {
+        eprintln!("stopped: Last.fm could not answer ({why}); run it again later to go on");
+    }
+}
+
+/// Adds the plays of a user's Last.fm history to their history here: what they heard anywhere, not only on this server. It
+/// is opt-in (the key in `SMARTPLAY_LASTFM_KEY`, and the Last.fm name is given by the operator) and a play already kept is
+/// not added again, so it can be run again to bring in what is newer.
+fn import_lastfm_command(store: Store, args: &[String]) {
+    let Some(key) = std::env::var("SMARTPLAY_LASTFM_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return eprintln!("set SMARTPLAY_LASTFM_KEY to import a Last.fm history");
+    };
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+    };
+    let words = positional(args);
+    let ([server, user], Some(lastfm_user)) = (words.as_slice(), flag("--lastfm-user")) else {
+        return eprintln!("usage: import-lastfm SERVER USER --lastfm-user NAME [--pages N]");
+    };
+    let pages = flag("--pages")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u32::MAX);
+    let client = lastfm::Client::new(key.trim());
+    let (plays, stopped) = lastfm::fetch_history(&client, lastfm_user, pages);
+    let read = plays.len();
+    match store.play_log(server, user).append_many(plays) {
+        Ok(added) => println!(
+            "{read} plays read from Last.fm, {added} new, {} already kept",
+            read - added
+        ),
+        Err(e) => return eprintln!("the history could not be written: {e}"),
+    }
+    if let Some(why) = stopped {
+        eprintln!("stopped: {why}; run it again later to go on (what was read is kept)");
+    }
+}
+
+/// Prints the mixes a user would get from the library and history the engine holds, and how well they would have predicted
+/// the last days of it (see `eval.rs`). Nothing is changed.
+fn eval_command(store: Store, args: &[String]) {
+    let number = |flag: &str, default: i64| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let words = positional(args);
+    let [server, user] = words.as_slice() else {
+        return eprintln!("usage: eval SERVER USER [--size N] [--holdout-days N]");
+    };
+    let Some(library) = store.library(server, user) else {
+        return eprintln!(
+            "the engine holds no library for {user} on {server}: run the plugin once"
+        );
+    };
+    let (played, baseline) = (store.plays(server, user), store.baseline(server, user));
+    let (decisions, cache) = (store.decisions(server, user), store.lastfm());
+    let recent = store.recent(server, user);
+    let report = eval::evaluate(
+        &eval::Input {
+            library: &library.songs,
+            played: &played,
+            baseline: baseline.as_ref(),
+            recent: &recent,
+            decisions: &decisions,
+            enrichment: &cache.known,
+        },
+        number("--size", MIX_SIZE as i64) as usize,
+        number("--holdout-days", 14),
+    );
+    print!("{}", report.render());
+}
+
+/// Deletes everything held about one user of a server: the library copy, the artist decisions and the history of plays.
+fn purge_command(store: Store, args: &[String]) {
+    match positional(args).as_slice() {
+        [server, user] => {
+            store.forget_user(server, user);
+            println!("deleted what is held about {user} on {server}");
+        }
+        _ => eprintln!("usage: purge SERVER USER"),
+    }
 }
 
 /// Artist names the user says are one artist or two, and what the library still leaves open. Names are matched as
@@ -464,12 +793,8 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                 let Ok(report) = serde_json::from_str::<PlayReport>(body) else {
                     return (400, "bad request".into());
                 };
-                // A play that names no song or no artist seeds nothing and would only take one of the kept places.
-                let play = &report.play;
-                if report.user.trim().is_empty()
-                    || play.song.trim().is_empty()
-                    || play.artists.iter().all(|a| a.trim().is_empty())
-                {
+                // A play that names no song (by id or by title) or no artist seeds nothing and would only take room.
+                if report.user.trim().is_empty() || !report.play.is_usable() {
                     return (400, "a play needs a user, a song and an artist".into());
                 }
                 return match store.record_play(&server.name, &report.user, report.play) {
@@ -480,25 +805,21 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
             let Ok(req) = serde_json::from_str::<ComputeRequest>(body) else {
                 return (400, "bad request".into());
             };
+            store.keep_recent(&server.name, &req.user, &req.recent);
             let answer = match store.library(&server.name, &req.user) {
                 Some(copy) if copy.fingerprint == req.fingerprint => {
                     let decisions = store.decisions(&server.name, &req.user);
-                    // What the engine saw played comes first, then the artists of the albums the server lists as
-                    // recent: they cover the time before the engine was told about plays. An artist named in both
-                    // takes one place, so the albums fill what the plays leave free.
+                    // The artists played most lately, and most of all; the albums the server lists as recent fill the
+                    // places the plays leave, for the time before the engine was told about plays.
                     let played = store.plays(&server.name, &req.user);
-                    let mut seen = HashSet::new();
-                    let recent: Vec<String> = plays::recent_artists(&played, RECENT_ARTISTS)
-                        .into_iter()
-                        .chain(req.recent.iter().cloned())
-                        .filter(|a| seen.insert(fold(a)))
-                        .take(RECENT_ARTISTS)
-                        .collect();
+                    let baseline = store.baseline(&server.name, &req.user);
+                    let recent = plays::seed_artists(&played, baseline.as_ref(), &req.recent);
                     let mixes = mix::recent_artist_mixes(
                         &copy.songs,
                         &recent,
                         &played,
                         &decisions,
+                        &store.lastfm().known,
                         MIX_SIZE,
                     )
                     .into_iter()
@@ -644,13 +965,15 @@ mod tests {
         );
     }
 
+    /// A play `at` seconds after a moment two months ago: the history keeps two years, and a test's plays must be recent.
     fn report_play(store: &Store, user: &str, song: &str, artist: &str, at: i64) -> u16 {
         let body = serde_json::to_string(&PlayReport {
             user: user.into(),
             play: Play {
                 song: song.into(),
                 artists: vec![artist.into()],
-                at,
+                at: now() as i64 - 60 * 24 * 3600 + at,
+                ..Play::default()
             },
         })
         .unwrap();
@@ -721,18 +1044,173 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_that_cannot_be_read_is_kept_aside_and_not_written_over() {
+    fn a_history_that_cannot_be_read_is_kept_aside_and_not_written_over() {
         let store = paired("corrupt");
-        let path = store.plays_path("home", "ana");
-        fs::write(&path, "{ not a list").unwrap();
+        let legacy = store.plays_path("home", "ana").with_extension("json");
+        fs::write(&legacy, "{ not a list").unwrap();
         assert_eq!(report_play(&store, "ana", "a1", "Queen", 1), 200);
         assert_eq!(store.plays("home", "ana").len(), 1);
         assert_eq!(
-            fs::read_to_string(path.with_extension("bad")).unwrap(),
+            fs::read_to_string(legacy.with_extension("bad")).unwrap(),
             "{ not a list"
         );
         store.forget_data("home");
-        assert!(!path.with_extension("bad").exists());
+        assert!(!legacy.with_extension("bad").exists());
+    }
+
+    #[test]
+    fn a_history_kept_as_a_list_is_moved_into_the_file_of_lines_when_the_next_play_comes() {
+        let store = paired("legacy");
+        let legacy = store.plays_path("home", "ana").with_extension("json");
+        let old = Play {
+            song: "a1".into(),
+            artists: vec!["Queen".into()],
+            at: now() as i64 - 1000,
+            ..Play::default()
+        };
+        fs::write(&legacy, serde_json::to_string(&[old]).unwrap()).unwrap();
+        assert_eq!(report_play(&store, "ana", "p1", "Portishead", 1), 200);
+        assert_eq!(store.plays("home", "ana").len(), 2);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn an_import_adds_the_plays_of_a_file_once_and_names_the_lines_that_are_not_plays() {
+        let store = paired("import");
+        let at = now() - 3600;
+        let text = format!(
+            "{{\"at\":{at},\"artist\":\"Portishead\",\"title\":\"Glory Box\"}}\n\
+             \n\
+             not a play\n\
+             {{\"at\":{},\"artist\":\"Portishead\",\"title\":\"Roads\",\"listened_ms\":9000,\"track_ms\":300000}}\n",
+            at + 400
+        );
+        let first = store.import_plays("home", "ana", "spotify", &text);
+        assert_eq!((first.read, first.added, first.invalid.len()), (2, 2, 1));
+        assert_eq!(
+            first.invalid[0].0, 3,
+            "the line number counts the blank line"
+        );
+        let again = store.import_plays("home", "ana", "spotify", &text);
+        assert_eq!((again.read, again.added), (2, 0));
+        let kept = store.plays("home", "ana");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].source, "import:spotify");
+        assert_eq!(kept[1].ended(), Some(plays::Ended::Skip));
+    }
+
+    #[test]
+    fn the_first_library_copy_gives_a_baseline_of_play_counts_and_later_ones_do_not_change_it() {
+        let store = paired("baseline");
+        let counted = |id: &str, count: Option<u32>| taste::Song {
+            play_count: count,
+            last_played: count.map(|_| "2026-11-20T08:33:59Z".to_string()),
+            ..song(id, "Queen")
+        };
+        upload(
+            &store,
+            "1@x",
+            &[vec![counted("a1", Some(7)), counted("a2", None)]],
+        );
+        let baseline = store.baseline("home", "ana").unwrap();
+        assert_eq!(baseline.tallies.len(), 1, "an unplayed song is no tally");
+        assert_eq!(
+            (baseline.tallies[0].song.as_str(), baseline.tallies[0].count),
+            ("a1", 7)
+        );
+        assert!(
+            store.library("home", "ana").unwrap().songs[0]
+                .play_count
+                .is_none(),
+            "the copy the mixes read holds no counts"
+        );
+        upload(&store, "2@y", &[vec![counted("a1", Some(9))]]);
+        assert_eq!(store.baseline("home", "ana").unwrap().tallies[0].count, 7);
+        store.forget_user("home", "ana");
+        assert!(store.baseline("home", "ana").is_none());
+    }
+
+    #[test]
+    fn what_last_fm_said_of_the_artists_widens_the_mixes_for_every_user() {
+        let store = paired("lastfm");
+        upload(
+            &store,
+            "1@x",
+            &[vec![
+                song("p1", "Portishead"),
+                song("m1", "Massive Attack"),
+                song("r1", "Radiohead"),
+            ]],
+        );
+        report_play(&store, "ana", "p1", "Portishead", 100);
+        assert_eq!(
+            mix_songs(compute(&store, "1@x")),
+            vec![vec!["p1".to_string()]]
+        );
+
+        let info = |tag: &str| smartplay_core::enrich::ArtistInfo {
+            tags: vec![(tag.to_string(), 1.0)],
+            similar: vec![],
+        };
+        let mut cache = lastfm::Cache::default();
+        cache.known.insert("Portishead", info("trip hop"));
+        cache.known.insert("Massive Attack", info("trip hop"));
+        cache.known.insert("Radiohead", info("rock"));
+        store.save_lastfm(&cache).unwrap();
+        assert_eq!(
+            mix_songs(compute(&store, "1@x")),
+            vec![vec!["p1".to_string(), "m1".to_string()]]
+        );
+    }
+
+    #[test]
+    fn the_artists_of_the_recent_albums_the_plugin_sent_are_kept_for_eval_and_purged_with_the_user()
+    {
+        let store = paired("recent-kept");
+        upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
+        compute_recent(&store, "1@x", &["Queen", "ABBA"]);
+        assert_eq!(store.recent("home", "ana"), ["Queen", "ABBA"]);
+        compute_recent(&store, "1@x", &[]);
+        assert!(store.recent("home", "ana").is_empty());
+        compute_recent(&store, "1@x", &["Queen"]);
+        store.forget_user("home", "ana");
+        assert!(store.recent("home", "ana").is_empty());
+    }
+
+    #[test]
+    fn a_purge_deletes_one_user_and_leaves_the_others() {
+        let store = paired("purge");
+        upload(&store, "1@x", &[vec![song("a1", "Queen")]]);
+        store.remember("home", "ana", |d| d.same("Queen", "Queen band"));
+        report_play(&store, "ana", "a1", "Queen", 100);
+        report_play(&store, "anabel", "a1", "Queen", 100);
+        store.forget_user("home", "ana");
+        assert!(store.library("home", "ana").is_none());
+        assert!(store.plays("home", "ana").is_empty());
+        assert_eq!(store.decisions("home", "ana"), Decisions::default());
+        assert_eq!(
+            store.plays("home", "anabel").len(),
+            1,
+            "a user whose name starts with the same letters is not touched"
+        );
+    }
+
+    #[test]
+    fn plays_of_songs_the_server_does_not_hold_are_kept() {
+        let store = paired("elsewhere");
+        let body = serde_json::to_string(&PlayReport {
+            user: "ana".into(),
+            play: Play {
+                artists: vec!["Portishead".into()],
+                title: "Glory Box".into(),
+                at: now() as i64 - 100,
+                source: "import:spotify".into(),
+                ..Play::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(call(&store, "/play", body, Some("tok")).0, 200);
+        assert_eq!(store.plays("home", "ana")[0].title, "Glory Box");
     }
 
     #[test]
@@ -766,27 +1244,48 @@ mod tests {
     }
 
     #[test]
-    fn an_artist_in_the_plays_and_the_albums_takes_one_place() {
+    fn an_artist_in_the_plays_and_the_albums_takes_one_place_and_the_albums_fill_the_rest() {
         let store = paired("dedup");
-        let mut songs = vec![];
-        for i in 0..15 {
-            songs.push(song(&format!("p{i}"), &format!("P{i}")));
-        }
-        for i in 0..5 {
-            songs.push(song(&format!("n{i}"), &format!("N{i}")));
-        }
-        upload(&store, "1@x", &[songs]);
-        for i in 0..15 {
-            report_play(&store, "ana", &format!("p{i}"), &format!("P{i}"), 100 + i);
-        }
-        // The albums name the same fifteen artists and five more: twenty in all, so none is cut off.
-        let albums: Vec<String> = (0..15)
-            .map(|i| format!("P{i}"))
-            .chain((0..5).map(|i| format!("N{i}")))
+        let songs: Vec<taste::Song> = ["P0", "N0", "N1", "N2"]
+            .iter()
+            .map(|a| song(&a.to_lowercase(), a))
             .collect();
-        let albums: Vec<&str> = albums.iter().map(String::as_str).collect();
-        let mixes = mix_songs(compute_recent(&store, "1@x", &albums));
-        assert!(mixes.iter().flatten().any(|id| id == "n4"), "{mixes:?}");
+        upload(&store, "1@x", &[songs]);
+        report_play(&store, "ana", "p0", "P0", 100);
+        // P0 is in the plays and first in the albums: it takes one of the three places for the artists played lately,
+        // N0 and N1 fill the other two, and N2 is left out.
+        let mixes = mix_songs(compute_recent(&store, "1@x", &["P0", "N0", "N1", "N2"]));
+        let flat: Vec<&str> = mixes.iter().flatten().map(String::as_str).collect();
+        assert!(flat.contains(&"n1"), "{mixes:?}");
+        assert!(!flat.contains(&"n2"), "{mixes:?}");
+    }
+
+    #[test]
+    fn the_artists_counted_before_the_engine_heard_of_plays_seed_the_mixes_as_the_most_played_of_all(
+    ) {
+        let store = paired("all-time");
+        let counted = |id: &str, artist: &str, count: u32| taste::Song {
+            play_count: Some(count),
+            ..song(id, artist)
+        };
+        let mut songs = vec![
+            counted("fav1", "Old Favourite", 90),
+            counted("mid1", "Mid", 50),
+            counted("x1", "Hardly", 1),
+        ];
+        songs.extend((0..3).map(|i| song(&format!("r{i}"), &format!("R{i}"))));
+        upload(&store, "1@x", &[songs]);
+        for i in 0..3 {
+            report_play(&store, "ana", &format!("r{i}"), &format!("R{i}"), 100 + i);
+        }
+        let flat: Vec<String> = mix_songs(compute(&store, "1@x"))
+            .into_iter()
+            .flatten()
+            .collect();
+        // The plays are older than the counts (they are in them), so the all-time two are the two most counted.
+        assert!(flat.contains(&"fav1".to_string()), "{flat:?}");
+        assert!(flat.contains(&"mid1".to_string()), "{flat:?}");
+        assert!(!flat.contains(&"x1".to_string()), "{flat:?}");
     }
 
     #[test]

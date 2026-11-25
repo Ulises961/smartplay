@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+pub mod enrich;
 pub mod identity;
 pub mod library;
 pub mod mix;
@@ -9,6 +10,7 @@ pub mod normalize;
 pub mod playlist;
 pub mod plays;
 pub mod protocol;
+pub mod scrobbles;
 pub mod taste;
 
 /// A way to call a Subsonic-compatible server. `request` is the endpoint with its query,
