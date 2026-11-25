@@ -70,6 +70,8 @@ fn mood(name: &str, tags: &[(&str, f64)], avoid: &[&str]) -> Mood {
 pub fn defaults() -> Vec<Mood> {
     vec![
         Mood {
+            // More than a bare `pop` (0.5): that one takes in the ballads of a pop artist.
+            min: 0.6,
             bpm: Some((115, 220)),
             ..mood(
                 "Active",
