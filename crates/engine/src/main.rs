@@ -8,10 +8,10 @@ mod lastfm;
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
-    mix,
+    mix, moods,
     plays::{self, Play},
     protocol::*,
-    taste,
+    taste, PLAYLIST_PREFIX,
 };
 use std::{
     fs,
@@ -24,8 +24,8 @@ const CODE_LIFETIME_SECS: u64 = 15 * 60;
 /// The playlist every granted user gets, and how many songs it holds.
 const PLAYLIST: &str = "smartplay";
 const PLAYLIST_SIZE: usize = 50;
-/// The mixes of the artists a user played lately are `smartplay: mix 1`, `mix 2` and so on, this many songs each.
-const MIX_PLAYLIST: &str = "smartplay: mix";
+/// The mixes of the artists a user played lately are `smartplay: mix of ARTISTS`, and the mixes of moods `smartplay: MOOD`;
+/// this many songs each.
 const MIX_SIZE: usize = 50;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
@@ -106,6 +106,31 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let _ = fs::remove_file(part);
         Ok(())
+    }
+
+    /// A file the operator may keep beside the engine's state, read each time it is needed so that a change applies at once.
+    fn setting_path(&self, file: &str) -> PathBuf {
+        let dir = self.0.parent().map(PathBuf::from).unwrap_or_default();
+        dir.join(file)
+    }
+
+    /// What decides the mixes: `tuning.json` in the data folder (see `mix::Tuning`), the defaults when there is none.
+    fn tuning(&self) -> Result<mix::Tuning, String> {
+        match fs::read_to_string(self.setting_path("tuning.json")) {
+            Ok(text) => mix::Tuning::parse(&text).map_err(|e| format!("tuning.json: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(mix::Tuning::default()),
+            Err(e) => Err(format!("tuning.json: {e}")),
+        }
+    }
+
+    /// The moods the mixes are made for: `moods.json` in the data folder (see `moods::parse`) replaces the built-in ones, an
+    /// empty list turns them off.
+    fn moods(&self) -> Result<Vec<moods::Mood>, String> {
+        match fs::read_to_string(self.setting_path("moods.json")) {
+            Ok(text) => moods::parse(&text).map_err(|e| format!("moods.json: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(moods::defaults()),
+            Err(e) => Err(format!("moods.json: {e}")),
+        }
     }
 
     fn lastfm_path(&self) -> PathBuf {
@@ -341,6 +366,19 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// The year it is by the clock, near enough: the moods that look at the years of songs do not need the day.
+fn current_year() -> u16 {
+    (1970 + now() / 31_556_952) as u16
+}
+
+/// A setting the operator wrote, or the default and a line in the log when it cannot be used.
+fn or_defaults<T>(read: Result<T, String>, defaults: T) -> T {
+    read.unwrap_or_else(|e| {
+        eprintln!("smartplay-engine: {e}; using the defaults");
+        defaults
+    })
+}
+
 /// Tells why a command could not do what it was asked, and ends it with a status that is not 0.
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("smartplay-engine: {message}");
@@ -399,6 +437,7 @@ fn main() {
         Some("import") => import_command(store, &args[1..]),
         Some("purge") => purge_command(store, &args[1..]),
         Some("eval") => eval_command(store, &args[1..]),
+        Some("moods") => moods_command(store),
         Some("enrich") => enrich_command(store, &args[1..]),
         Some("import-lastfm") => import_lastfm_command(store, &args[1..]),
         _ => eprintln!(
@@ -406,7 +445,8 @@ fn main() {
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
              smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
              smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
-             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
+             smartplay-engine moods [--data DIR]   (the moods in use, as JSON; put your own in DIR/moods.json)\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--base-share X] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
@@ -464,7 +504,7 @@ fn import_command(store: Store, args: &[String]) {
     );
 }
 
-/// Asks Last.fm for the tags and close artists of the artists of a user's library, the ones heard most first, and keeps the
+/// Asks Last.fm for the tags, close artists and most played tracks of the artists of a user's library, the ones heard most first, and keeps the
 /// answers for every user. It is opt-in (it needs the key in `SMARTPLAY_LASTFM_KEY`) and sends nothing but artist names. A
 /// run asks for `--limit` artists at most (100 by default) and the next run goes on from there.
 fn enrich_command(store: Store, args: &[String]) {
@@ -566,6 +606,18 @@ fn import_lastfm_command(store: Store, args: &[String]) {
     }
 }
 
+/// Prints the moods the engine makes mixes for, as the JSON of `moods.json`: the file's, or the built-in ones to start a file
+/// from.
+fn moods_command(store: Store) {
+    match store.moods() {
+        Ok(moods) => match serde_json::to_string_pretty(&moods) {
+            Ok(text) => println!("{text}"),
+            Err(e) => fail(e),
+        },
+        Err(e) => fail(e),
+    }
+}
+
 /// Prints the mixes a user would get from the library and history the engine holds, and how well they would have predicted
 /// the last days of it (see `eval.rs`). Nothing is changed.
 fn eval_command(store: Store, args: &[String]) {
@@ -586,12 +638,14 @@ fn eval_command(store: Store, args: &[String]) {
     let words = positional(args);
     let [server, user] = words.as_slice() else {
         return eprintln!(
-            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N]"
+            "usage: eval SERVER USER [--size N] [--holdout-days N] [--base-share X] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N]"
         );
     };
+    // What the engine uses (tuning.json), then what the options try instead.
     let tuning = {
-        let base = smartplay_core::mix::Tuning::default();
-        smartplay_core::mix::Tuning {
+        let base = store.tuning().unwrap_or_else(|e| fail(e));
+        mix::Tuning {
+            base_share: share("--base-share", base.base_share),
             min_aligned: share("--min-aligned", base.min_aligned),
             min_fit: share("--min-fit", base.min_fit),
             min_content: share("--min-content", base.min_content),
@@ -599,6 +653,10 @@ fn eval_command(store: Store, args: &[String]) {
             max_mixes: number("--max-mixes", base.max_mixes as i64).max(1) as usize,
         }
     };
+    if let Err(e) = tuning.check() {
+        return eprintln!("{e}");
+    }
+    let moods = store.moods().unwrap_or_else(|e| fail(e));
     let Some(library) = store.library(server, user) else {
         return eprintln!(
             "the engine holds no library for {user} on {server}: run the plugin once"
@@ -616,6 +674,8 @@ fn eval_command(store: Store, args: &[String]) {
             decisions: &decisions,
             enrichment: &cache.known,
             tuning,
+            moods: &moods,
+            year: current_year(),
         },
         number("--size", MIX_SIZE as i64) as usize,
         number("--holdout-days", 14),
@@ -855,21 +915,47 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     let played = store.plays(&server.name, &req.user);
                     let baseline = store.baseline(&server.name, &req.user);
                     let recent = plays::seed_artists(&played, baseline.as_ref(), &req.recent);
-                    let mixes = mix::recent_artist_mixes(
+                    // A setting that cannot be used is reported and the defaults stand in, so that a typo in a file
+                    // cannot stop the playlists.
+                    let tuning = or_defaults(store.tuning(), mix::Tuning::default());
+                    let enrichment = store.lastfm().known;
+                    let mut mixes: Vec<Mix> = mix::recent_artist_mixes_explained(
                         &copy.songs,
                         &recent,
                         &played,
                         &decisions,
-                        &store.lastfm().known,
+                        &enrichment,
                         MIX_SIZE,
+                        &tuning,
                     )
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, songs)| Mix {
-                        playlist: format!("{MIX_PLAYLIST} {}", i + 1),
-                        songs,
+                    .map(|chosen| Mix {
+                        playlist: format!(
+                            "{PLAYLIST_PREFIX}{}",
+                            mix::mix_title(&copy.songs, &chosen)
+                        ),
+                        songs: chosen.into_iter().map(|c| c.id).collect(),
                     })
                     .collect();
+                    mixes.extend(
+                        moods::mood_mixes(
+                            &copy.songs,
+                            &or_defaults(store.moods(), moods::defaults()),
+                            &moods::Context {
+                                heard: &plays::artist_counts(&played, baseline.as_ref()),
+                                decisions: &decisions,
+                                enrichment: &enrichment,
+                                year: current_year(),
+                            },
+                            MIX_SIZE,
+                            &tuning,
+                        )
+                        .into_iter()
+                        .map(|(name, chosen)| Mix {
+                            playlist: format!("{PLAYLIST_PREFIX}{name}"),
+                            songs: chosen.into_iter().map(|c| c.id).collect(),
+                        }),
+                    );
                     ComputeResponse::Playlist {
                         playlist: PLAYLIST.into(),
                         songs: taste::more_of_what_you_star(
@@ -1020,9 +1106,114 @@ mod tests {
         assert_eq!(
             mixes,
             vec![Mix {
-                playlist: "smartplay: mix 1".into(),
+                playlist: "smartplay: mix of Portishead".into(),
                 songs: vec!["p1".into()],
             }]
+        );
+    }
+
+    /// `n` songs of one genre, each by an artist of its own.
+    fn genre_songs(prefix: &str, genre: &str, n: usize) -> Vec<taste::Song> {
+        (0..n)
+            .map(|i| taste::Song {
+                genres: vec![genre.into()],
+                ..song(&format!("{prefix}{i:02}"), &format!("{prefix} artist {i}"))
+            })
+            .collect()
+    }
+
+    fn playlists(answer: ComputeResponse) -> Vec<(String, usize)> {
+        let ComputeResponse::Playlist { mixes, .. } = answer else {
+            panic!("the library is there");
+        };
+        mixes
+            .into_iter()
+            .map(|m| (m.playlist, m.songs.len()))
+            .collect()
+    }
+
+    #[test]
+    fn the_moods_get_a_playlist_each_named_after_the_mood_beside_the_mixes_of_artists() {
+        let store = paired("moods");
+        let mut library = genre_songs("c", "Classical", 20);
+        library.extend(genre_songs("r", "Rock", 20));
+        upload(&store, "1@x", &[library]);
+        let lists = playlists(compute_recent(&store, "1@x", &["r artist 0"]));
+        assert!(
+            lists.contains(&("smartplay: Classical".to_string(), 20)),
+            "{lists:?}"
+        );
+        assert!(
+            lists
+                .iter()
+                .any(|(name, _)| name.starts_with("smartplay: mix of ")
+                    && name.contains("r artist 0")),
+            "{lists:?}"
+        );
+        assert!(
+            lists.iter().all(|(name, _)| name != "smartplay: Hits"),
+            "no pop, no hits: {lists:?}"
+        );
+    }
+
+    #[test]
+    fn moods_json_replaces_the_built_in_moods_and_a_broken_one_leaves_the_defaults() {
+        let store = paired("moods-file");
+        upload(&store, "1@x", &[genre_songs("t", "Tango", 20)]);
+        assert!(playlists(compute(&store, "1@x")).is_empty());
+        let file = store.setting_path("moods.json");
+        fs::write(&file, r#"[{"name":"Milonga","tags":{"tango":1}}]"#).unwrap();
+        assert_eq!(
+            playlists(compute(&store, "1@x")),
+            vec![("smartplay: Milonga".to_string(), 20)]
+        );
+        fs::write(&file, "[]").unwrap();
+        assert!(
+            playlists(compute(&store, "1@x")).is_empty(),
+            "an empty list turns the moods off"
+        );
+        fs::write(&file, r#"[{"name":"Milonga","tags":{}}]"#).unwrap();
+        assert!(store.moods().unwrap_err().contains("moods.json"));
+        let lists = playlists(compute(&store, "1@x"));
+        assert!(
+            lists.iter().all(|(name, _)| name != "smartplay: Milonga"),
+            "{lists:?}"
+        );
+    }
+
+    #[test]
+    fn the_share_of_the_artists_played_is_read_from_tuning_json() {
+        let store = paired("tuning-file");
+        let mut library = genre_songs("a", "Rock", 30);
+        library.extend(genre_songs("b", "Rock", 60));
+        for (i, s) in library
+            .iter_mut()
+            .filter(|s| s.id.starts_with('a'))
+            .enumerate()
+        {
+            s.artist = format!("Played {}", i % 3);
+        }
+        upload(&store, "1@x", &[library]);
+        let base_songs = |store: &Store| {
+            let ComputeResponse::Playlist { mixes, .. } =
+                compute_recent(store, "1@x", &["Played 0", "Played 1", "Played 2"])
+            else {
+                panic!("the library is there");
+            };
+            let songs = &mixes[0].songs;
+            (
+                songs.iter().filter(|id| id.starts_with('a')).count(),
+                songs.len(),
+            )
+        };
+        assert_eq!(base_songs(&store), (20, 50), "40% by default");
+        fs::write(store.setting_path("tuning.json"), r#"{"base_share": 0.1}"#).unwrap();
+        assert_eq!(base_songs(&store), (5, 50));
+        fs::write(store.setting_path("tuning.json"), r#"{"base_share": 7}"#).unwrap();
+        assert_eq!(
+            base_songs(&store),
+            (20, 50),
+            "a value that cannot be used leaves the default"
         );
     }
 
@@ -1212,6 +1403,7 @@ mod tests {
         let info = |tag: &str| smartplay_core::enrich::ArtistInfo {
             tags: vec![(tag.to_string(), 1.0)],
             similar: vec![],
+            top: None,
         };
         let mut cache = lastfm::Cache::default();
         cache.known.insert("Portishead", info("trip hop"));

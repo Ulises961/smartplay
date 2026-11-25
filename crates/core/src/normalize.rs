@@ -44,6 +44,24 @@ pub fn fold(text: &str) -> String {
 
 /// The words of a folded name that identify it: no articles, joiners or small prepositions.
 /// A name made only of such words (`The The`) keeps them.
+/// The title of a work, folded: without a track number the file's tag carries in front (`04 Siguiendo la Luna`) and without
+/// the part after ` - ` or in brackets, so `Tangled - Demo`, `Maps - Live In Manchester` and `Magic Dance (Remix)` are
+/// `tangled`, `maps` and `magic dance`. What tells the versions of one song from each other, and what lets a title of the
+/// library be found in a list another service keeps.
+pub fn work_title(title: &str) -> String {
+    let digits = title.bytes().take_while(u8::is_ascii_digit).count();
+    let title = match title[digits..].strip_prefix(' ') {
+        Some(rest) if (1..=3).contains(&digits) && !rest.trim().is_empty() => rest.trim_start(),
+        _ => title,
+    };
+    let end = [" - ", " (", " ["]
+        .iter()
+        .filter_map(|cut| title.find(cut))
+        .min()
+        .unwrap_or(title.len());
+    fold(&title[..end])
+}
+
 pub fn content_tokens(folded: &str) -> Vec<String> {
     let all: Vec<&str> = folded.split(' ').filter(|w| !w.is_empty()).collect();
     let content: Vec<String> = all

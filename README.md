@@ -89,34 +89,76 @@ the engine, the plugin drops its token and logs `engine rejected the token`; ent
 Star songs in any Subsonic client. Within a minute each granted user finds a playlist named `smartplay`. Grant or
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
-Play some songs and each user also finds up to three playlists, `smartplay: mix 1`, `smartplay: mix 2` and
-`smartplay: mix 3`, of up to 50 songs each, built from the artists they played last. The recent artists are grouped by how
-well they fit each other, so artists that sound unlike do not share a mix, and one artist does not take a mix over.
-About 60% of a mix are songs of those artists, and 40% are songs of other artists: the ones whose genres and moods are
-close, the ones that outside services (see Last.fm below) call close, and the ones the user tends to play in the same
-sitting (plays less than an hour apart) as the artists of the mix. A song only gets in if it fits well enough, so a mix may
-be shorter than 50 songs rather than filled with weak matches. They work for a user who has starred nothing, and they are
-ordinary playlists too.
+Play some songs and each user also finds up to three playlists named after the artists they are built on, such as
+`smartplay: mix of Queen, David Bowie +1`, of up to 50 songs each, built from the artists they played last. The recent
+artists are grouped by how well they fit each other, so artists that sound unlike do not share a mix, and one artist does
+not take a mix over. About 40% of a mix are songs of those artists, and 60% are songs of other artists: the ones whose
+genres and moods are close, the ones that outside services (see Last.fm below) call close, and the ones the user tends to
+play in the same sitting (plays less than an hour apart) as the artists of the mix. A song only gets in if it fits well
+enough, so a mix may be shorter than 50 songs rather than filled with weak matches. They work for a user who has starred
+nothing, and they are ordinary playlists too. A mix is named after the artists it is built on, so when the artists played
+lately change, a new playlist appears and the old one stays as it was: delete the ones you do not want.
 
-The plugin tells the engine about each finished play (Navidrome's scrobbler capability), so a mix follows what was played
-a minute ago: the playlists are rewritten on the plugin's next run. The engine keeps the plays of each user for two years
-(see Privacy). If the engine cannot be reached, Navidrome holds the play and sends it again. Before the engine has heard
-of any play, and for what was played before the plugin was installed, the mixes start from the play counts of the first
-copy of the library the engine received and from the artists of the albums the server lists as recently played.
+Beside them, each user gets a playlist for each **mood**: `smartplay: Active`, `smartplay: Classical`, `smartplay: Focus`
+and `smartplay: Hits`. A mood is a recipe of tags (the genres and moods of the songs and what Last.fm says of their
+artists), and its playlist holds the songs that fit it and nothing else, the artists the user plays more first, with no
+artist taking more than a fifth of it. A mood with fewer than 10 songs that fit gets no playlist. The built-in recipes go by
+genre, because that is what most libraries have: `Classical` is classical music (`Clásica` too), `Focus` is classical,
+instrumental, ambient and the like, `Active` is pop, dance and the like (and leaves out slow genres), and `Hits` is pop that
+Last.fm says is played a lot: the most played fifth of the songs of the library it has a count for, the most played first.
+That needs `enrich` (see Last.fm below); until it has run, `Hits` has no playlist. Last.fm tells how much a song is played,
+not when it came out, so `Hits` is not limited to the last years unless you add `years_back` to its recipe (and the files
+carry years). Songs that carry a BPM are also kept to the tempo of the mood (`Active`
+is 115 and up, `Focus` is 100 and down); a library with no BPM tags is not held back by it.
+
+The recipes are the engine's, not the plugin's. `smartplay-engine moods` prints them as JSON; put your own, or the same with
+changes, in `moods.json` in the engine's data folder. The file replaces the built-in recipes (an empty list turns the moods
+off) and is read on each run, so a change applies within a minute, and a recipe that is wrong is reported in the engine's log
+and the built-in ones stay in use:
+
+```json
+[
+  {
+    "name": "Tango night",
+    "tags": { "tango": 1.0, "milonga": 1.0, "vals": 0.6 },
+    "avoid": ["rock"],
+    "min": 0.5,
+    "years_back": null,
+    "bpm": null
+  }
+]
+```
+
+`tags` are the genres, moods and Last.fm tags that make a song fit, each with its weight (a song's fit is the sum of the
+weights of the tags it has, at most 1), `avoid` rules a song out, `min` is the fit a song needs, `years_back` keeps the songs
+of this many years (this year counts as one), `bpm` is `[low, high]` and `min_popularity` (0 to 1) keeps the songs Last.fm
+counts among that share of the most played, and puts the most played first. A tag matches the song's tag when it is the same or
+one of its words, ignoring case and accents. The playlist is `smartplay: ` and the name.
+
+What decides the mixes of artists can be tuned too, in `tuning.json` in the same folder (every field is optional, and a value
+that is not valid is reported and the defaults stand in): `base_share` (the share of a mix that is of the artists played, 0.4),
+`min_fit`, `min_content`, `min_aligned`, `max_artist_share` and `max_mixes`. `eval` takes the same names as options (see
+below), so a value can be tried before it is written down.
 
 To see why a song is in a mix, run `eval` (see [deploy/README.md](deploy/README.md)): it prints each mix with the reason
 of every song, how well the artists of each mix fit, and how well the mixes would have predicted the last days of plays.
-It can also try other thresholds without a new build.
+It can also try other thresholds, such as `--base-share 0.5`, without a new build, and it prints the mood playlists too.
 
 ### Last.fm (optional)
 
 Two commands of the engine use Last.fm, and nothing else does. Both are run by the operator, with the operator's own API
 key, and neither runs on its own:
 
-- `enrich` asks Last.fm for the tags and the close artists of the artists of a library. It sends artist names and your API
-  key, and nothing else, to Last.fm. What it answers widens the mixes for every user.
+- `enrich` asks Last.fm for the tags, the close artists and the most played tracks of the artists of a library. It sends
+  artist names and your API key, and nothing else, to Last.fm. What it answers widens the mixes for every user, and the
+  play counts rank the `Hits` mood. Artists asked about by an earlier version are asked again, only for their most played
+  tracks.
 - `import-lastfm` brings the history of a user's Last.fm account in as plays. It sends the Last.fm user name and your API
   key, and nothing of the library.
+
+What Last.fm gives is Last.fm's, and its [API terms](https://www.last.fm/api/tos) apply to your key: non-commercial use, and
+credit to Last.fm. smartplay stores the tags, close artists and most played tracks for the artists of your own library, a
+small part of the 100 MB the terms allow.
 
 `smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
 example to keep only unplayed songs, or songs of one genre, in random order:
@@ -145,7 +187,7 @@ the machine where you run it, in the engine's data folder:
   (the plugin, or an import). This is a history of listening, and it is what the mixes are made from;
 - the play counts of the first copy of the library the engine received, and the artists of the albums the plugin last
   listed as recent;
-- the tags and close artists Last.fm gave for artist names, if you ran `enrich`. They are kept in one file for every user,
+- the tags, close artists and most played tracks Last.fm gave for artist names, if you ran `enrich`. They are kept in one file for every user,
   `enrichment-lastfm.json`, and they are not removed by the commands below: delete the file to remove them.
 
 Removing a server on the engine (`servers remove NAME`) deletes the library copies, decisions, plays, play counts and recent

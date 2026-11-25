@@ -12,9 +12,11 @@ use smartplay_core::{
     enrich::Enrichment,
     identity::Decisions,
     mix::{self, Tuning},
+    moods::{self, Mood},
     normalize::fold,
     plays::{self, Baseline, Ended, Play},
     taste::Song,
+    PLAYLIST_PREFIX,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -30,8 +32,11 @@ pub struct Report {
     pub matched_plays: usize,
     pub skips: usize,
     pub seeds: Vec<String>,
-    /// The mixes now, as lines of `artist - title`.
+    /// The mixes now, as lines of `artist - title`, and the playlist each is written to.
     pub mixes: Vec<Vec<String>>,
+    pub mix_titles: Vec<String>,
+    /// The mixes of the moods, in the same form.
+    pub mood_mixes: Vec<(String, Vec<String>)>,
     /// What each of the mixes is made of, in the same order.
     pub mix_stats: Vec<MixStats>,
     pub holdout: Option<Holdout>,
@@ -127,6 +132,9 @@ pub struct Input<'a> {
     pub decisions: &'a Decisions,
     pub enrichment: &'a Enrichment,
     pub tuning: Tuning,
+    pub moods: &'a [Mood],
+    /// The year it is.
+    pub year: u16,
 }
 
 /// The mixes for `input`, and the check against the last `holdout_days` of its history.
@@ -139,6 +147,8 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
         decisions,
         enrichment,
         tuning,
+        moods,
+        year,
     } = *input;
     let index = Index::new(library);
     let name_of: HashMap<&str, String> = library
@@ -201,18 +211,31 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
                 }
             })
             .collect(),
-        mixes: explained
+        mixes: explained.iter().map(|m| lines(m, &name_of, why)).collect(),
+        mix_titles: explained
             .iter()
-            .map(|m| {
-                m.iter()
-                    .map(|c| {
-                        let name = name_of.get(c.id.as_str()).cloned();
-                        let name = name.unwrap_or(c.id.clone());
-                        format!("{name}   [{}]", why(c))
-                    })
-                    .collect()
-            })
+            .map(|m| format!("{PLAYLIST_PREFIX}{}", mix::mix_title(library, m)))
             .collect(),
+        mood_mixes: moods::mood_mixes(
+            library,
+            moods,
+            &moods::Context {
+                heard: &plays::artist_counts(played, baseline),
+                decisions,
+                enrichment,
+                year,
+            },
+            size,
+            &tuning,
+        )
+        .into_iter()
+        .map(|(name, chosen)| {
+            (
+                format!("{PLAYLIST_PREFIX}{name}"),
+                lines(&chosen, &name_of, mood_why),
+            )
+        })
+        .collect(),
         holdout: None,
         holdout_without_enrichment: None,
     };
@@ -283,6 +306,20 @@ fn holdout(input: &Input, enrichment: &Enrichment, size: usize, days: i64) -> Op
     })
 }
 
+/// The lines of a mix: `artist - title   [why]`.
+fn lines(
+    mix: &[mix::Chosen],
+    name_of: &HashMap<&str, String>,
+    reason: fn(&mix::Chosen) -> String,
+) -> Vec<String> {
+    mix.iter()
+        .map(|c| {
+            let name = name_of.get(c.id.as_str()).cloned();
+            format!("{}   [{}]", name.unwrap_or(c.id.clone()), reason(c))
+        })
+        .collect()
+}
+
 /// The reason a song is in a mix, for its line: an artist played lately, or the parts of a similar song's score.
 fn why(song: &mix::Chosen) -> String {
     if song.base {
@@ -296,6 +333,11 @@ fn why(song: &mix::Chosen) -> String {
             song.tags + song.together + 0.5 * song.close
         )
     }
+}
+
+/// The reason a song is in a mood's mix: how much of the recipe it has.
+fn mood_why(song: &mix::Chosen) -> String {
+    format!("fits {:.2}", song.tags)
 }
 
 fn ratio(part: usize, whole: usize) -> f64 {
@@ -326,7 +368,8 @@ impl Report {
         );
         let _ = writeln!(out, "seeds: {}", self.seeds.join(", "));
         for (i, mix) in self.mixes.iter().enumerate() {
-            let _ = writeln!(out, "\nmix {} ({} songs)", i + 1, mix.len());
+            let title = self.mix_titles.get(i).map_or("mix", String::as_str);
+            let _ = writeln!(out, "\n{title} ({} songs)", mix.len());
             if let Some(stats) = self.mix_stats.get(i) {
                 let fit = stats
                     .fit
@@ -342,6 +385,12 @@ impl Report {
                     artists.join(", ")
                 );
             }
+            for song in mix {
+                let _ = writeln!(out, "  {song}");
+            }
+        }
+        for (title, mix) in &self.mood_mixes {
+            let _ = writeln!(out, "\n{title} ({} songs)", mix.len());
             for song in mix {
                 let _ = writeln!(out, "  {song}");
             }
@@ -440,6 +489,8 @@ mod tests {
                 decisions: &Decisions::default(),
                 enrichment: &Enrichment::default(),
                 tuning: Tuning::default(),
+                moods: &moods::defaults(),
+                year: 2026,
             },
             10,
             14,

@@ -2,10 +2,14 @@
 
 use serde::Deserialize;
 
+/// What every playlist the engine asks for starts with, after the main one (`smartplay`): `smartplay: Focus`.
+pub const PLAYLIST_PREFIX: &str = "smartplay: ";
+
 pub mod enrich;
 pub mod identity;
 pub mod library;
 pub mod mix;
+pub mod moods;
 pub mod normalize;
 pub mod playlist;
 pub mod plays;
