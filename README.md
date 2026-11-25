@@ -104,8 +104,11 @@ and `smartplay: Hits`. A mood is a recipe of tags (the genres and moods of the s
 artists), and its playlist holds the songs that fit it and nothing else, the artists the user plays more first, with no
 artist taking more than a fifth of it. A mood with fewer than 10 songs that fit gets no playlist. The built-in recipes go by
 genre, because that is what most libraries have: `Classical` is classical music (`Clásica` too), `Focus` is classical,
-instrumental, ambient and the like, `Active` is pop, dance and the like (and leaves out slow genres), and `Hits` is pop from
-this year and last. A song with no year is not a hit. Songs that carry a BPM are also kept to the tempo of the mood (`Active`
+instrumental, ambient and the like, `Active` is pop, dance and the like (and leaves out slow genres), and `Hits` is pop that
+Last.fm says is played a lot: the most played fifth of the songs of the library it has a count for, the most played first.
+That needs `enrich` (see Last.fm below); until it has run, `Hits` has no playlist. Last.fm tells how much a song is played,
+not when it came out, so `Hits` is not limited to the last years unless you add `years_back` to its recipe (and the files
+carry years). Songs that carry a BPM are also kept to the tempo of the mood (`Active`
 is 115 and up, `Focus` is 100 and down); a library with no BPM tags is not held back by it.
 
 The recipes are the engine's, not the plugin's. `smartplay-engine moods` prints them as JSON; put your own, or the same with
@@ -128,7 +131,8 @@ and the built-in ones stay in use:
 
 `tags` are the genres, moods and Last.fm tags that make a song fit, each with its weight (a song's fit is the sum of the
 weights of the tags it has, at most 1), `avoid` rules a song out, `min` is the fit a song needs, `years_back` keeps the songs
-of this many years (this year counts as one) and `bpm` is `[low, high]`. A tag matches the song's tag when it is the same or
+of this many years (this year counts as one), `bpm` is `[low, high]` and `min_popularity` (0 to 1) keeps the songs Last.fm
+counts among that share of the most played, and puts the most played first. A tag matches the song's tag when it is the same or
 one of its words, ignoring case and accents. The playlist is `smartplay: ` and the name.
 
 What decides the mixes of artists can be tuned too, in `tuning.json` in the same folder (every field is optional, and a value
@@ -145,10 +149,16 @@ It can also try other thresholds, such as `--base-share 0.5`, without a new buil
 Two commands of the engine use Last.fm, and nothing else does. Both are run by the operator, with the operator's own API
 key, and neither runs on its own:
 
-- `enrich` asks Last.fm for the tags and the close artists of the artists of a library. It sends artist names and your API
-  key, and nothing else, to Last.fm. What it answers widens the mixes for every user.
+- `enrich` asks Last.fm for the tags, the close artists and the most played tracks of the artists of a library. It sends
+  artist names and your API key, and nothing else, to Last.fm. What it answers widens the mixes for every user, and the
+  play counts rank the `Hits` mood. Artists asked about by an earlier version are asked again, only for their most played
+  tracks.
 - `import-lastfm` brings the history of a user's Last.fm account in as plays. It sends the Last.fm user name and your API
   key, and nothing of the library.
+
+What Last.fm gives is Last.fm's, and its [API terms](https://www.last.fm/api/tos) apply to your key: non-commercial use, and
+credit to Last.fm. smartplay stores the tags, close artists and most played tracks for the artists of your own library, a
+small part of the 100 MB the terms allow.
 
 `smartplay` is an ordinary playlist, so Navidrome's smart playlists can use it as their source with `inPlaylist`, for
 example to keep only unplayed songs, or songs of one genre, in random order:
@@ -177,7 +187,7 @@ the machine where you run it, in the engine's data folder:
   (the plugin, or an import). This is a history of listening, and it is what the mixes are made from;
 - the play counts of the first copy of the library the engine received, and the artists of the albums the plugin last
   listed as recent;
-- the tags and close artists Last.fm gave for artist names, if you ran `enrich`. They are kept in one file for every user,
+- the tags, close artists and most played tracks Last.fm gave for artist names, if you ran `enrich`. They are kept in one file for every user,
   `enrichment-lastfm.json`, and they are not removed by the commands below: delete the file to remove them.
 
 Removing a server on the engine (`servers remove NAME`) deletes the library copies, decisions, plays, play counts and recent

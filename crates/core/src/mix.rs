@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::enrich::Enrichment;
 use crate::identity::{resolve, Decisions, Track};
-use crate::normalize::fold;
+use crate::normalize::{fold, work_title};
 use crate::plays::{self, Play};
 use crate::taste::Song;
 
@@ -650,19 +650,7 @@ const VARIANT_PENALTY: f64 = 4.0;
 /// `Maps - Live In Manchester` and `Magic Dance (Remix)` are versions of `Tangled`, `Maps` and `Magic Dance`. They stay
 /// different songs; this only tells a mix not to fill itself with the variants of one.
 pub(crate) fn song_key(song: &Song) -> String {
-    let title = song.title.as_str();
-    // A track number the file's tag carries in front of the title (`04 Siguiendo la Luna`) is not part of the song.
-    let digits = title.bytes().take_while(u8::is_ascii_digit).count();
-    let title = match title[digits..].strip_prefix(' ') {
-        Some(rest) if (1..=3).contains(&digits) && !rest.trim().is_empty() => rest.trim_start(),
-        _ => title,
-    };
-    let end = [" - ", " (", " ["]
-        .iter()
-        .filter_map(|cut| title.find(cut))
-        .min()
-        .unwrap_or(title.len());
-    format!("{}\u{1}{}", fold(&song.artist), fold(&title[..end]))
+    format!("{}\u{1}{}", fold(&song.artist), work_title(&song.title))
 }
 
 /// Up to `limit` ids, best first, and how many of them (the first ones) keep every artist within `cap` songs. Each pick
@@ -1307,6 +1295,7 @@ mod tests {
                 ArtistInfo {
                     tags: tags.iter().map(|(t, w)| (t.to_string(), *w)).collect(),
                     similar: similar.iter().map(|(a, m)| (a.to_string(), *m)).collect(),
+                    top: None,
                 },
             );
         }

@@ -37,7 +37,10 @@ const RETRY_WAIT: Duration = Duration::from_secs(2);
 
 /// Asking about one artist.
 pub trait Lookup {
+    /// Everything: its tags, its close artists and its most played tracks.
     fn info(&self, artist: &str) -> Result<ArtistInfo, Failure>;
+    /// Only its most played tracks (see `ArtistInfo::top`), for an artist asked about before they were.
+    fn top(&self, artist: &str) -> Result<Vec<(String, u64)>, Failure>;
 }
 
 /// Last.fm over HTTP, one request at a time, at least `gap` apart.
@@ -119,7 +122,23 @@ impl Lookup for Client {
             self.retrying(|| enrich::parse_top_tags(&self.get("artist.getTopTags", &about)?))?;
         let similar =
             self.retrying(|| enrich::parse_similar(&self.get("artist.getSimilar", &about)?))?;
-        Ok(ArtistInfo { tags, similar })
+        // Known by its tags, so an artist whose tracks the service cannot list is an artist with no tracks listed.
+        let top = match self.top(artist) {
+            Ok(top) => top,
+            Err(Failure::Unknown) => vec![],
+            Err(e) => return Err(e),
+        };
+        Ok(ArtistInfo {
+            tags,
+            similar,
+            top: Some(top),
+        })
+    }
+
+    fn top(&self, artist: &str) -> Result<Vec<(String, u64)>, Failure> {
+        // `limit` is the documented default, said out loud: the answer is what the service lists first, by popularity.
+        let about = [("artist", artist), ("autocorrect", "1"), ("limit", "50")];
+        self.retrying(|| enrich::parse_top_tracks(&self.get("artist.getTopTracks", &about)?))
     }
 }
 
@@ -189,6 +208,15 @@ impl Cache {
                 .get(&fold(artist))
                 .is_none_or(|&at| now - at > RETRY_FAILED_AFTER)
     }
+
+    /// An artist known from before its most played tracks were asked for, and not paused after a failed try.
+    fn needs_top(&self, artist: &str, now: i64) -> bool {
+        self.known.get(artist).is_some_and(|i| i.top.is_none())
+            && self
+                .failed
+                .get(&fold(artist))
+                .is_none_or(|&at| now - at > RETRY_FAILED_AFTER)
+    }
 }
 
 /// How a run went.
@@ -219,10 +247,28 @@ pub fn fill(
         if outcome.asked >= limit {
             break;
         }
-        if !cache.needs_asking(artist, now) {
+        let only_top = cache.needs_top(artist, now);
+        if !only_top && !cache.needs_asking(artist, now) {
             continue;
         }
-        match lookup.info(artist) {
+        let answer = if only_top {
+            // What is known stays; the service not knowing the artist's tracks is an empty list, not a lost artist.
+            let known = cache.known.get(artist).cloned().unwrap_or_default();
+            match lookup.top(artist) {
+                Ok(top) => Ok(ArtistInfo {
+                    top: Some(top),
+                    ..known
+                }),
+                Err(Failure::Unknown) => Ok(ArtistInfo {
+                    top: Some(vec![]),
+                    ..known
+                }),
+                Err(e) => Err(e),
+            }
+        } else {
+            lookup.info(artist)
+        };
+        match answer {
             Ok(info) => {
                 cache.unknown.remove(&fold(artist));
                 cache.failed.remove(&fold(artist));
@@ -308,9 +354,69 @@ mod tests {
                 _ => Ok(ArtistInfo {
                     tags: vec![("rock".into(), 1.0)],
                     similar: vec![],
+                    top: Some(vec![("a song".into(), 10)]),
                 }),
             }
         }
+
+        fn top(&self, artist: &str) -> Result<Vec<(String, u64)>, Failure> {
+            self.0.borrow_mut().push(format!("top of {artist}"));
+            match artist {
+                "Busy" => Err(Failure::Temporary("Rate limit exceeded".into())),
+                _ => Ok(vec![("a song".into(), 10)]),
+            }
+        }
+    }
+
+    #[test]
+    fn an_artist_known_from_before_its_tracks_were_asked_for_is_asked_only_for_them() {
+        let mut cache = Cache::default();
+        cache.known.insert(
+            "Old",
+            ArtistInfo {
+                tags: vec![("jazz".into(), 1.0)],
+                similar: vec![("Close".into(), 0.9)],
+                top: None,
+            },
+        );
+        let fake = Fake(RefCell::new(vec![]));
+        let order = names(&["Old", "New"]);
+        let run = fill(&mut cache, &order, &fake, 10, 1000);
+        assert_eq!((run.asked, run.known), (2, 2));
+        assert_eq!(*fake.0.borrow(), ["top of Old", "New"]);
+        let old = cache.known.get("Old").unwrap();
+        assert_eq!(
+            old.tags,
+            vec![("jazz".to_string(), 1.0)],
+            "what was known stays"
+        );
+        assert_eq!(old.similar.len(), 1);
+        assert_eq!(old.top, Some(vec![("a song".to_string(), 10)]));
+        assert_eq!(
+            fill(&mut cache, &order, &fake, 10, 1001).asked,
+            0,
+            "nothing is left to ask"
+        );
+    }
+
+    #[test]
+    fn a_failed_ask_for_the_tracks_of_a_known_artist_waits_and_leaves_what_is_known() {
+        let mut cache = Cache::default();
+        cache.known.insert("Busy", ArtistInfo::default());
+        let fake = Fake(RefCell::new(vec![]));
+        let order = names(&["Busy"]);
+        let first = fill(&mut cache, &order, &fake, 10, 1000);
+        assert_eq!((first.asked, first.skipped), (1, 1));
+        assert!(cache.known.get("Busy").is_some());
+        assert_eq!(
+            fill(&mut cache, &order, &fake, 10, 1001).asked,
+            0,
+            "paused for a few hours"
+        );
+        assert_eq!(
+            fill(&mut cache, &order, &fake, 10, 1000 + RETRY_FAILED_AFTER + 1).asked,
+            1
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -377,9 +483,15 @@ mod tests {
         impl Lookup for Down {
             fn info(&self, artist: &str) -> Result<ArtistInfo, Failure> {
                 match artist {
-                    "A" | "C" => Ok(ArtistInfo::default()),
+                    "A" | "C" => Ok(ArtistInfo {
+                        top: Some(vec![]),
+                        ..ArtistInfo::default()
+                    }),
                     _ => Err(Failure::Temporary("Service offline".into())),
                 }
+            }
+            fn top(&self, _: &str) -> Result<Vec<(String, u64)>, Failure> {
+                Err(Failure::Temporary("Service offline".into()))
             }
         }
         let run = fill(&mut cache, &order, &Down, 10, 1000);
@@ -489,16 +601,24 @@ mod tests {
                 200,
                 r#"{"similarartists":{"artist":[{"name":"Massive Attack","match":"0.8"}]}}"#,
             ),
+            (
+                200,
+                r#"{"toptracks":{"track":[{"name":"Glory Box","playcount":"700"}]}}"#,
+            ),
         ]);
         let client = Client::with("the-key", &base, Duration::ZERO, Duration::ZERO);
         let info = client.info("Portishead").unwrap();
         assert_eq!(info.tags, [("trip hop".to_string(), 1.0)]);
         assert_eq!(info.similar[0].0, "Massive Attack");
+        assert_eq!(info.top, Some(vec![("glory box".to_string(), 700)]));
         let urls = handle.join().unwrap();
         assert!(
             urls[0].contains("method=artist.getTopTags") && urls[0].contains("artist=Portishead")
         );
         assert!(urls[1].contains("method=artist.getSimilar"));
+        assert!(
+            urls[2].contains("method=artist.getTopTracks") && urls[2].contains("artist=Portishead")
+        );
         assert!(
             urls.iter()
                 .all(|u| u.contains("api_key=the-key") && !u.contains("user")),
@@ -512,11 +632,12 @@ mod tests {
             (502, "<html>Bad gateway</html>"),
             (200, r#"{"toptags":{"tag":[{"count":100,"name":"rock"}]}}"#),
             (200, r#"{"similarartists":{"artist":[]}}"#),
+            (200, r#"{"toptracks":{"track":[]}}"#),
         ]);
         let client = Client::with("k", &base, Duration::ZERO, Duration::ZERO);
         let info = client.info("Anyone").unwrap();
         assert_eq!(info.tags, [("rock".to_string(), 1.0)]);
-        assert_eq!(handle.join().unwrap().len(), 3);
+        assert_eq!(handle.join().unwrap().len(), 4);
     }
 
     #[test]

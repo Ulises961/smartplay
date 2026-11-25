@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::normalize::fold;
+use crate::normalize::{fold, work_title};
 
 /// A tag counts when it is at least this share of the artist's strongest tag (Last.fm scales the strongest to 100).
 const MIN_TAG_WEIGHT: f64 = 0.1;
@@ -39,6 +39,11 @@ pub struct ArtistInfo {
     pub tags: Vec<(String, f64)>,
     /// Names of close artists and how close, between 0 and 1, the closest first.
     pub similar: Vec<(String, f64)>,
+    /// The artist's most played tracks on the service: the title of the work (see `normalize::work_title`) and how many
+    /// times it was played, the most played first. `None` when the service was not asked yet, which is not the same as an
+    /// artist with no tracks to list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<Vec<(String, u64)>>,
 }
 
 /// What is known of the artists of a library, by folded artist name.
@@ -97,6 +102,28 @@ struct RawTag {
     name: String,
     #[serde(default, deserialize_with = "number")]
     count: f64,
+}
+
+#[derive(Deserialize)]
+struct TopTracks {
+    toptracks: TrackList,
+}
+#[derive(Deserialize)]
+struct TrackList {
+    /// Absent when the answer has no list at all, which is not the same as an empty one; one track may come alone.
+    track: Option<OneOrMany<RawTrack>>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    Many(Vec<T>),
+    One(T),
+}
+#[derive(Deserialize)]
+struct RawTrack {
+    name: String,
+    #[serde(default, deserialize_with = "number")]
+    playcount: f64,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +201,33 @@ pub fn parse_top_tags(text: &str) -> Result<Vec<(String, f64)>, Failure> {
     Ok(tags)
 }
 
+/// The tracks in an `artist.getTopTracks` answer, by the title of the work (see `normalize::work_title`), the most played
+/// first. Versions of one work (`Fever`, `Fever - Live`) count as the most played of them. An answer with no list of tracks
+/// is not an answer about the artist (it is how a service that changed its reply would look), so it is "could not answer".
+pub fn parse_top_tracks(text: &str) -> Result<Vec<(String, u64)>, Failure> {
+    let parsed: TopTracks = read(text)?;
+    let tracks = match parsed.toptracks.track {
+        Some(OneOrMany::Many(list)) => list,
+        Some(OneOrMany::One(one)) => vec![one],
+        None => {
+            return Err(Failure::Temporary(
+                "an answer with no list of tracks".into(),
+            ))
+        }
+    };
+    let mut best: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for track in tracks {
+        let title = work_title(&track.name);
+        if !title.is_empty() && track.playcount > 0.0 {
+            let played = best.entry(title).or_default();
+            *played = (*played).max(track.playcount as u64);
+        }
+    }
+    let mut top: Vec<(String, u64)> = best.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(top)
+}
+
 /// The artists in an `artist.getSimilar` answer, the closest first, with how close between 0 and 1.
 pub fn parse_similar(text: &str) -> Result<Vec<(String, f64)>, Failure> {
     let parsed: Similar = read(text)?;
@@ -211,6 +265,48 @@ mod tests {
         assert!(
             !names.contains(&"british"),
             "3 of 100 is under the minimum weight"
+        );
+    }
+
+    #[test]
+    fn the_top_tracks_are_by_work_most_played_first_and_a_lone_track_is_a_list() {
+        let text = r#"{"toptracks":{"track":[
+            {"name":"Fever","playcount":"500","listeners":"9","mbid":"","url":"u","@attr":{"rank":"1"}},
+            {"name":"Fever - Live","playcount":"900","listeners":"3","url":"u"},
+            {"name":"Houdini","playcount":1200,"url":"u"},
+            {"name":"Silence","playcount":"0","url":"u"},
+            {"name":" ","playcount":"7","url":"u"}],
+            "@attr":{"artist":"Dua Lipa","page":"1","perPage":"50","totalPages":"9","total":"430"}}}"#;
+        assert_eq!(
+            parse_top_tracks(text).unwrap(),
+            vec![("houdini".to_string(), 1200), ("fever".to_string(), 900)]
+        );
+        let alone = r#"{"toptracks":{"track":{"name":"Only One","playcount":"12"}}}"#;
+        assert_eq!(
+            parse_top_tracks(alone).unwrap(),
+            vec![("only one".to_string(), 12)]
+        );
+        assert_eq!(
+            parse_top_tracks(r#"{"toptracks":{"track":[]}}"#).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_list_of_tracks_is_not_taken_for_an_artist_with_none() {
+        for odd in [
+            r#"{"toptracks":{"@attr":{"artist":"X"}}}"#,
+            r#"{"tracks":{"track":[]}}"#,
+            "<lfm>xml</lfm>",
+        ] {
+            assert!(
+                matches!(parse_top_tracks(odd), Err(Failure::Temporary(_))),
+                "{odd}"
+            );
+        }
+        assert_eq!(
+            parse_top_tracks(r#"{"error":6,"message":"no such artist"}"#),
+            Err(Failure::Unknown)
         );
     }
 
@@ -264,6 +360,7 @@ mod tests {
             ArtistInfo {
                 tags: vec![("post rock".into(), 1.0)],
                 similar: vec![],
+                top: None,
             },
         );
         assert!(known.get("sigur ros").is_some());

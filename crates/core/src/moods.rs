@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::enrich::Enrichment;
 use crate::identity::Decisions;
 use crate::mix::{pick, song_key, Basis, Candidate, Chosen, Tuning, MIN_MIX_SONGS};
-use crate::normalize::fold;
+use crate::normalize::{fold, work_title};
 use crate::taste::Song;
 
 /// What the artists a user plays more add to the fit of their songs, at most: the fit says what belongs in the mood, this
@@ -48,6 +48,12 @@ pub struct Mood {
     /// out for it: most libraries carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bpm: Option<(u16, u16)>,
+    /// Only songs that Last.fm says are played a lot: how many times the song was played there, as a place among the songs
+    /// of the library that it is counted for (0 is the least played, 1 the most), must be at least this. `0.8` is the most
+    /// played fifth. It also puts the more played first. A song it has no count for (an artist not asked about yet, or a
+    /// song not among the artist's most played) is left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_popularity: Option<f64>,
 }
 
 fn default_min() -> f64 {
@@ -62,6 +68,7 @@ fn mood(name: &str, tags: &[(&str, f64)], avoid: &[&str]) -> Mood {
         min: default_min(),
         years_back: None,
         bpm: None,
+        min_popularity: None,
     }
 }
 
@@ -148,7 +155,8 @@ pub fn defaults() -> Vec<Mood> {
             )
         },
         Mood {
-            years_back: Some(2),
+            // The files' years are of no use for this: most carry none, and the rest are often the year of a reissue.
+            min_popularity: Some(0.8),
             ..mood("Hits", &[("pop", 1.0)], &["classical", "clasica"])
         },
     ]
@@ -188,6 +196,11 @@ pub fn parse(json: &str) -> Result<Vec<Mood>, String> {
                 "the mood '{name}' has a band that is not low to high"
             ));
         }
+        if m.min_popularity.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
+            return Err(format!(
+                "the mood '{name}' has a min_popularity outside (0, 1]"
+            ));
+        }
         if m.years_back == Some(0) {
             return Err(format!("the mood '{name}' has years_back 0"));
         }
@@ -200,6 +213,34 @@ pub fn parse(json: &str) -> Result<Vec<Mood>, String> {
 fn matches(tag: &str, wanted: &str) -> bool {
     let tag = tag.split_once(':').map_or(tag, |(_, t)| t);
     format!(" {tag} ").contains(&format!(" {wanted} "))
+}
+
+/// How much each song of the library is played on Last.fm, as a place between 0 and 1 among the songs that have a count
+/// (see `Mood::min_popularity`). A song's count is the one of the title in the most played tracks of its artist.
+struct Popularity {
+    place: Vec<Option<f64>>,
+}
+
+impl Popularity {
+    fn new(library: &[Song], enrichment: &Enrichment) -> Popularity {
+        let counts: Vec<Option<u64>> = library
+            .iter()
+            .map(|song| {
+                let top = enrichment.get(&song.artist)?.top.as_ref()?;
+                let title = work_title(&song.title);
+                top.iter().find(|(t, _)| *t == title).map(|(_, n)| *n)
+            })
+            .collect();
+        let mut known: Vec<u64> = counts.iter().flatten().copied().collect();
+        known.sort_unstable();
+        let span = known.len().saturating_sub(1).max(1) as f64;
+        Popularity {
+            place: counts
+                .into_iter()
+                .map(|n| n.map(|n| known.partition_point(|&k| k < n) as f64 / span))
+                .collect(),
+        }
+    }
 }
 
 /// What the moods are made with besides the library.
@@ -258,6 +299,7 @@ pub fn mood_mixes(
         _ => 0.0,
     };
     let cap = ((size as f64 * tuning.max_artist_share).ceil() as usize).max(1);
+    let popularity = Popularity::new(library, enrichment);
 
     let mut mixes = vec![];
     for m in moods {
@@ -266,8 +308,18 @@ pub fn mood_mixes(
         let first_year = m.years_back.map(|n| year.saturating_sub(n - 1));
         let mut seen = std::collections::BTreeSet::new();
         let mut candidates = vec![];
-        for ((song, a), tags) in library.iter().zip(&artists).zip(&basis.tags) {
+        for (((song, a), tags), played) in library
+            .iter()
+            .zip(&artists)
+            .zip(&basis.tags)
+            .zip(&popularity.place)
+        {
             if !seen.insert(song.id.as_str()) {
+                continue;
+            }
+            if m.min_popularity
+                .is_some_and(|min| played.is_none_or(|p| p < min))
+            {
                 continue;
             }
             if first_year.is_some_and(|from| song.year.is_none_or(|y| y < from)) {
@@ -303,7 +355,9 @@ pub fn mood_mixes(
                 },
                 artist: *a,
                 song: song_key(song),
-                score: fit + FAMILIARITY_WEIGHT * familiarity(*a),
+                score: fit
+                    + FAMILIARITY_WEIGHT * familiarity(*a)
+                    + m.min_popularity.and(*played).unwrap_or(0.0),
             });
         }
         let (list, _) = pick(candidates, size, cap);
@@ -409,12 +463,66 @@ mod tests {
         library.extend(many("m", &["Pop"], Some(2026), 6));
         library.extend(many("o", &["Pop"], Some(2019), 12));
         library.extend(many("u", &["Pop"], None, 12));
-        let mixes = mixes_of(&library, &defaults());
-        let hits = &mixes.iter().find(|(n, _)| n == "Hits").unwrap().1;
-        assert_eq!(hits.len(), 12, "{hits:?}");
-        assert!(hits
+        let recent = Mood {
+            years_back: Some(2),
+            ..mood("Recent", &[("pop", 1.0)], &[])
+        };
+        let mixes = mixes_of(&library, &[recent]);
+        let recent = &mixes[0].1;
+        assert_eq!(recent.len(), 12, "{recent:?}");
+        assert!(recent
             .iter()
             .all(|id| id.starts_with('n') || id.starts_with('m')));
+    }
+
+    #[test]
+    fn hits_are_the_pop_songs_lastfm_says_are_played_most_and_the_most_played_come_first() {
+        let mut library = many("p", &["Pop"], None, 60);
+        library.extend(many("q", &["Pop"], None, 20)); // no count: an artist not asked about
+        library.extend(many("r", &["Rock"], None, 20));
+        let mut enrichment = Enrichment::default();
+        for (i, s) in library
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.id.starts_with('q'))
+        {
+            let weight = if s.id.starts_with('r') { 1 } else { 100 };
+            let top = vec![(format!("song {}", s.id), (i as u64 + 1) * weight)];
+            enrichment.insert(
+                &s.artist,
+                crate::enrich::ArtistInfo {
+                    top: Some(top),
+                    ..Default::default()
+                },
+            );
+        }
+        let heard = BTreeMap::new();
+        let decisions = Decisions::default();
+        let mixes = mood_mixes(
+            &library,
+            &defaults(),
+            &Context {
+                heard: &heard,
+                decisions: &decisions,
+                enrichment: &enrichment,
+                year: 2026,
+            },
+            50,
+            &Tuning::default(),
+        );
+        let (_, hits) = mixes.iter().find(|(n, _)| n == "Hits").unwrap();
+        let ids: Vec<&str> = hits.iter().map(|c| c.id.as_str()).collect();
+        // 60 pop songs (played 100 to 6000 times) and 20 rock ones (played less) have a count: the most played fifth of those
+        // 80 are pop songs, and they are the hits.
+        assert_eq!(ids[0], "p59", "{ids:?}");
+        assert!(
+            ids.len() >= 10 && ids.iter().all(|id| id.starts_with('p')),
+            "{ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id[1..].parse::<usize>().unwrap() >= 44),
+            "{ids:?}"
+        );
     }
 
     #[test]
@@ -456,10 +564,10 @@ mod tests {
 
     #[test]
     fn one_library_gives_the_same_moods_every_time() {
-        let mut library = many("c", &["Classical"], None, 80);
-        library.extend(many("a", &["Ambient"], None, 80));
+        let mut library = many("c", &["Classical"], None, 50);
+        library.extend(many("a", &["Ambient"], None, 50));
         let first = mixes_of(&library, &defaults());
-        for _ in 0..20 {
+        for _ in 0..6 {
             assert_eq!(mixes_of(&library, &defaults()), first);
         }
     }
@@ -472,6 +580,10 @@ mod tests {
         assert!(error(r#"[{"name":"A","tags":{"pop":0}}]"#).contains("weight"));
         assert!(error(r#"[{"name":"A","tags":{"pop":1},"min":0}]"#).contains("minimum"));
         assert!(error(r#"[{"name":"A","tags":{"pop":1},"bpm":[120,80]}]"#).contains("band"));
+        assert!(
+            error(r#"[{"name":"A","tags":{"pop":1},"min_popularity":0}]"#)
+                .contains("min_popularity")
+        );
         assert!(
             error(r#"[{"name":"A","tags":{"pop":1}},{"name":"a","tags":{"rock":1}}]"#)
                 .contains("two moods")

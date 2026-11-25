@@ -504,7 +504,7 @@ fn import_command(store: Store, args: &[String]) {
     );
 }
 
-/// Asks Last.fm for the tags and close artists of the artists of a user's library, the ones heard most first, and keeps the
+/// Asks Last.fm for the tags, close artists and most played tracks of the artists of a user's library, the ones heard most first, and keeps the
 /// answers for every user. It is opt-in (it needs the key in `SMARTPLAY_LASTFM_KEY`) and sends nothing but artist names. A
 /// run asks for `--limit` artists at most (100 by default) and the next run goes on from there.
 fn enrich_command(store: Store, args: &[String]) {
@@ -1403,6 +1403,7 @@ mod tests {
         let info = |tag: &str| smartplay_core::enrich::ArtistInfo {
             tags: vec![(tag.to_string(), 1.0)],
             similar: vec![],
+            top: None,
         };
         let mut cache = lastfm::Cache::default();
         cache.known.insert("Portishead", info("trip hop"));

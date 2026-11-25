@@ -122,7 +122,7 @@ These are opt-in and need a Last.fm API key. Pass it for the one command, so tha
 docker exec -e SMARTPLAY_LASTFM_KEY=KEY smartplay-engine smartplay-engine import-lastfm default USER_NAME \
   --lastfm-user LASTFM_NAME --data /state          # what was heard anywhere; run it again for what is newer
 docker exec -e SMARTPLAY_LASTFM_KEY=KEY smartplay-engine smartplay-engine enrich default USER_NAME \
-  --data /state --limit 300                        # tags and close artists of the library's artists, a few hundred a run
+  --data /state --limit 300                        # tags, close artists and most played tracks of the library's artists, a few hundred a run (three requests each)
 ```
 
 `import-lastfm` sends the Last.fm name and nothing of the library; `enrich` sends artist names and nothing else. `import FILE`
