@@ -24,7 +24,7 @@ const CODE_LIFETIME_SECS: u64 = 15 * 60;
 /// The playlist every granted user gets, and how many songs it holds.
 const PLAYLIST: &str = "smartplay";
 const PLAYLIST_SIZE: usize = 50;
-/// The mixes of the artists a user played lately are `smartplay: mix 1` and `smartplay: mix 2`, this many songs each.
+/// The mixes of the artists a user played lately are `smartplay: mix 1`, `mix 2` and so on, this many songs each.
 const MIX_PLAYLIST: &str = "smartplay: mix";
 const MIX_SIZE: usize = 50;
 
@@ -390,7 +390,7 @@ fn main() {
              smartplay-engine artists same|different SERVER USER NAME NAME | artists list SERVER USER\n       \
              smartplay-engine enrich SERVER USER [--limit N] [--data DIR]   (the key is in SMARTPLAY_LASTFM_KEY)\n       \
              smartplay-engine import-lastfm SERVER USER --lastfm-user NAME [--pages N] [--data DIR]\n       \
-             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--data DIR]\n       \
+             smartplay-engine eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N] [--data DIR]\n       \
              smartplay-engine import SERVER USER FILE [--source NAME] [--data DIR] | purge SERVER USER [--data DIR]"
         ),
     }
@@ -560,9 +560,28 @@ fn eval_command(store: Store, args: &[String]) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
+    let share = |flag: &str, default: f64| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
     let words = positional(args);
     let [server, user] = words.as_slice() else {
-        return eprintln!("usage: eval SERVER USER [--size N] [--holdout-days N]");
+        return eprintln!(
+            "usage: eval SERVER USER [--size N] [--holdout-days N] [--min-fit X] [--min-content X] [--min-aligned X] [--max-share X] [--max-mixes N]"
+        );
+    };
+    let tuning = {
+        let base = smartplay_core::mix::Tuning::default();
+        smartplay_core::mix::Tuning {
+            min_aligned: share("--min-aligned", base.min_aligned),
+            min_fit: share("--min-fit", base.min_fit),
+            min_content: share("--min-content", base.min_content),
+            max_artist_share: share("--max-share", base.max_artist_share),
+            max_mixes: number("--max-mixes", base.max_mixes as i64).max(1) as usize,
+        }
     };
     let Some(library) = store.library(server, user) else {
         return eprintln!(
@@ -580,6 +599,7 @@ fn eval_command(store: Store, args: &[String]) {
             recent: &recent,
             decisions: &decisions,
             enrichment: &cache.known,
+            tuning,
         },
         number("--size", MIX_SIZE as i64) as usize,
         number("--holdout-days", 14),
@@ -877,6 +897,14 @@ mod tests {
         }
     }
 
+    /// A song of the one style, so that the artists of a test that need to share a mix fit each other.
+    fn rock(id: &str, artist: &str) -> taste::Song {
+        taste::Song {
+            genres: vec!["Rock".into()],
+            ..song(id, artist)
+        }
+    }
+
     fn call(store: &Store, url: &str, body: String, token: Option<&str>) -> (u16, String) {
         route(store, url, &body, token.map(String::from))
     }
@@ -1013,7 +1041,7 @@ mod tests {
         upload(
             &store,
             "1@x",
-            &[vec![song("a1", "Queen"), song("p1", "Portishead")]],
+            &[vec![rock("a1", "Queen"), rock("p1", "Portishead")]],
         );
         report_play(&store, "ana", "p1", "Portishead", 100);
         // The album listing names Queen; the play says Portishead, which is the more recent artist.
@@ -1248,7 +1276,11 @@ mod tests {
         let store = paired("dedup");
         let songs: Vec<taste::Song> = ["P0", "N0", "N1", "N2"]
             .iter()
-            .map(|a| song(&a.to_lowercase(), a))
+            // N2 is of no style, so that nothing brings it in as a similar song: it is in only if it is a seed.
+            .map(|a| match *a {
+                "N2" => song("n2", a),
+                _ => rock(&a.to_lowercase(), a),
+            })
             .collect();
         upload(&store, "1@x", &[songs]);
         report_play(&store, "ana", "p0", "P0", 100);
@@ -1266,14 +1298,18 @@ mod tests {
         let store = paired("all-time");
         let counted = |id: &str, artist: &str, count: u32| taste::Song {
             play_count: Some(count),
-            ..song(id, artist)
+            ..rock(id, artist)
         };
         let mut songs = vec![
             counted("fav1", "Old Favourite", 90),
             counted("mid1", "Mid", 50),
-            counted("x1", "Hardly", 1),
+            // Not a seed, and of no style: nothing brings it in as a similar song.
+            taste::Song {
+                genres: vec![],
+                ..counted("x1", "Hardly", 1)
+            },
         ];
-        songs.extend((0..3).map(|i| song(&format!("r{i}"), &format!("R{i}"))));
+        songs.extend((0..3).map(|i| rock(&format!("r{i}"), &format!("R{i}"))));
         upload(&store, "1@x", &[songs]);
         for i in 0..3 {
             report_play(&store, "ana", &format!("r{i}"), &format!("R{i}"), 100 + i);
