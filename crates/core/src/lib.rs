@@ -2,8 +2,14 @@
 
 use serde::Deserialize;
 
-/// What every playlist the engine asks for starts with, after the main one (`smartplay`): `smartplay: Focus`.
-pub const PLAYLIST_PREFIX: &str = "smartplay: ";
+/// What the name of every playlist the engine asks for ends with, after the main one (`smartplay`): `Focus - Smartplay`.
+/// The plugin finds its playlists by exact name, so the ending is also what tells them from the user's own.
+pub const PLAYLIST_SUFFIX: &str = " - Smartplay";
+
+/// The name of a playlist titled `title`: `Focus` is `Focus - Smartplay`.
+pub fn playlist_name(title: &str) -> String {
+    format!("{}{PLAYLIST_SUFFIX}", title.trim())
+}
 
 pub mod enrich;
 pub mod identity;

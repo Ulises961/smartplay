@@ -8,10 +8,10 @@ mod lastfm;
 use serde::{Deserialize, Serialize};
 use smartplay_core::{
     identity::{self, Decisions},
-    mix, moods,
+    mix, moods, playlist_name,
     plays::{self, Play},
     protocol::*,
-    taste, PLAYLIST_PREFIX,
+    taste,
 };
 use std::{
     fs,
@@ -24,8 +24,8 @@ const CODE_LIFETIME_SECS: u64 = 15 * 60;
 /// The playlist every granted user gets, and how many songs it holds.
 const PLAYLIST: &str = "smartplay";
 const PLAYLIST_SIZE: usize = 50;
-/// The mixes of the artists a user played lately are `smartplay: mix of ARTISTS`, and the mixes of moods `smartplay: MOOD`;
-/// this many songs each.
+/// The mixes of the artists a user played lately are `ARTISTS - Smartplay`, and the mixes of moods `MOOD - Smartplay`; this
+/// many songs each.
 const MIX_SIZE: usize = 50;
 
 /// A user's library as the engine holds it, with the fingerprint it had when it was read.
@@ -919,6 +919,8 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     // cannot stop the playlists.
                     let tuning = or_defaults(store.tuning(), mix::Tuning::default());
                     let enrichment = store.lastfm().known;
+                    let moods = or_defaults(store.moods(), moods::defaults());
+                    let mood_names: Vec<&str> = moods.iter().map(|m| m.name.as_str()).collect();
                     let mut mixes: Vec<Mix> = mix::recent_artist_mixes_explained(
                         &copy.songs,
                         &recent,
@@ -930,17 +932,14 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                     )
                     .into_iter()
                     .map(|chosen| Mix {
-                        playlist: format!(
-                            "{PLAYLIST_PREFIX}{}",
-                            mix::mix_title(&copy.songs, &chosen)
-                        ),
+                        playlist: mix::artist_mix_playlist(&copy.songs, &chosen, &mood_names),
                         songs: chosen.into_iter().map(|c| c.id).collect(),
                     })
                     .collect();
                     mixes.extend(
                         moods::mood_mixes(
                             &copy.songs,
-                            &or_defaults(store.moods(), moods::defaults()),
+                            &moods,
                             &moods::Context {
                                 heard: &plays::artist_counts(&played, baseline.as_ref()),
                                 decisions: &decisions,
@@ -952,7 +951,7 @@ fn route(store: &Store, url: &str, body: &str, bearer: Option<String>) -> (u16, 
                         )
                         .into_iter()
                         .map(|(name, chosen)| Mix {
-                            playlist: format!("{PLAYLIST_PREFIX}{name}"),
+                            playlist: playlist_name(&name),
                             songs: chosen.into_iter().map(|c| c.id).collect(),
                         }),
                     );
@@ -1106,7 +1105,7 @@ mod tests {
         assert_eq!(
             mixes,
             vec![Mix {
-                playlist: "smartplay: mix of Portishead".into(),
+                playlist: "Portishead - Smartplay".into(),
                 songs: vec!["p1".into()],
             }]
         );
@@ -1140,19 +1139,46 @@ mod tests {
         upload(&store, "1@x", &[library]);
         let lists = playlists(compute_recent(&store, "1@x", &["r artist 0"]));
         assert!(
-            lists.contains(&("smartplay: Classical".to_string(), 20)),
+            lists.contains(&("Classical - Smartplay".to_string(), 20)),
             "{lists:?}"
         );
         assert!(
             lists
                 .iter()
-                .any(|(name, _)| name.starts_with("smartplay: mix of ")
-                    && name.contains("r artist 0")),
+                .any(|(name, _)| name.ends_with(" - Smartplay") && name.contains("r artist 0")),
             "{lists:?}"
         );
         assert!(
-            lists.iter().all(|(name, _)| name != "smartplay: Hits"),
+            lists.iter().all(|(name, _)| name != "Hits - Smartplay"),
             "no pop, no hits: {lists:?}"
+        );
+    }
+
+    #[test]
+    fn an_artist_called_like_a_mood_does_not_take_the_name_of_the_mood_playlist() {
+        let store = paired("clash");
+        // A band called Focus, and enough ambient songs by other artists for the Focus mood.
+        let mut library: Vec<taste::Song> = (0..12)
+            .map(|i| taste::Song {
+                genres: vec!["Rock".into()],
+                album: "Own album".into(),
+                ..song(&format!("f{i:02}"), "Focus")
+            })
+            .collect();
+        library.extend(genre_songs("a", "Ambient", 20));
+        upload(&store, "1@x", &[library]);
+        let lists = playlists(compute_recent(&store, "1@x", &["Focus"]));
+        let names: Vec<&str> = lists.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Focus - Smartplay"), "the mood: {names:?}");
+        assert!(
+            names.contains(&"Focus (artists) - Smartplay"),
+            "the band: {names:?}"
+        );
+        let unique: std::collections::BTreeSet<&&str> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "no two playlists share a name: {names:?}"
         );
     }
 
@@ -1165,7 +1191,7 @@ mod tests {
         fs::write(&file, r#"[{"name":"Milonga","tags":{"tango":1}}]"#).unwrap();
         assert_eq!(
             playlists(compute(&store, "1@x")),
-            vec![("smartplay: Milonga".to_string(), 20)]
+            vec![("Milonga - Smartplay".to_string(), 20)]
         );
         fs::write(&file, "[]").unwrap();
         assert!(
@@ -1176,7 +1202,7 @@ mod tests {
         assert!(store.moods().unwrap_err().contains("moods.json"));
         let lists = playlists(compute(&store, "1@x"));
         assert!(
-            lists.iter().all(|(name, _)| name != "smartplay: Milonga"),
+            lists.iter().all(|(name, _)| name != "Milonga - Smartplay"),
             "{lists:?}"
         );
     }

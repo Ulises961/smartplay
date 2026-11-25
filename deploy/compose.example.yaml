@@ -3,7 +3,7 @@
 # It joins the stack's own network and publishes no port, so nothing outside the stack can reach it. The plugin runs inside
 # Navidrome and calls the engine by its service name, `smartplay-engine`: Docker's DNS gives the name the engine's current
 # address, so recreating the container changes nothing in the plugin's settings. The plugin may only reach the hosts its
-# manifest lists, so the stack's network is given a fixed range, and that range is what goes into the plugin (README.md).
+# manifest lists, so the stack's network is given a fixed range, and that range is what goes into the plugin (deploy/README.md).
 services:
   smartplay-engine:
     # VERSION: a release of the engine (see the releases of the repository).
@@ -17,7 +17,7 @@ services:
 volumes:
   smartplay-state:
 
-# The network the services share. Put the range the stack has now (README.md, step 1): a different one recreates the network
+# The network the services share. Put the range the stack has now (deploy/README.md, step 1): a different one recreates the network
 # and restarts every service on it, Navidrome included. If the stack already declares `networks: default:`, add the `ipam`
 # part to it.
 networks:
