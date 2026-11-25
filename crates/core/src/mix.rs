@@ -1,7 +1,7 @@
 //! Mixes from the artists a user played lately.
 //!
-//! Each mix is built on those artists (the base, 60%) and widened with songs by other artists whose tags are close to
-//! the base (the similar part, 40%). Tags are the genres and moods of the songs; a tag shared by few songs of the
+//! Each mix is built on those artists (the base, 40%) and widened with songs by other artists whose tags are close to
+//! the base (the similar part, 60%). Tags are the genres and moods of the songs; a tag shared by few songs of the
 //! library says more than one shared by most of them, so rare tags weigh more. What the user played together says
 //! more still: an artist heard in the same sittings as the base artists is close to them, whatever its tags.
 //!
@@ -9,21 +9,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::enrich::Enrichment;
 use crate::identity::{resolve, Decisions, Track};
 use crate::normalize::fold;
 use crate::plays::{self, Play};
 use crate::taste::Song;
 
-/// Of every [`ROUND`] songs of a mix, this many come from the artists played and the rest are similar songs: 60%.
-const BASE_PER_ROUND: usize = 3;
-const ROUND: usize = 5;
 /// A mix shorter than this is left out when a longer one exists (or is the only one left when none is that long).
-const MIN_MIX_SONGS: usize = 10;
+pub(crate) const MIN_MIX_SONGS: usize = 10;
 
-/// What decides who shares a mix and what gets in; `eval` takes them as options to try values without a new build.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What decides who shares a mix and what gets in. `eval` takes them as options to try values without a new build, and the
+/// engine reads them from `tuning.json` in its data folder (every field is optional there).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Tuning {
+    /// The share of a mix that comes from the artists played lately (the base), between 0 and 1; the rest are similar songs.
+    /// Whichever part cannot give its share, the other fills the gap.
+    pub base_share: f64,
     /// Two groups of recent artists share a mix when the average of how close their artists are (see `affinities`)
     /// reaches this.
     pub min_aligned: f64,
@@ -43,12 +47,49 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Tuning {
         Tuning {
+            base_share: 0.4,
             min_aligned: 0.4,
             min_fit: 0.5,
             min_content: 0.45,
             max_artist_share: 0.2,
             max_mixes: 3,
         }
+    }
+}
+
+impl Tuning {
+    /// The tuning in a JSON object whose fields are all optional (what is left out keeps its default), or why it is not
+    /// usable: an unknown field is an error, so that a typo does not quietly tune nothing.
+    pub fn parse(json: &str) -> Result<Tuning, String> {
+        let tuning: Tuning = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        tuning.check()?;
+        Ok(tuning)
+    }
+
+    /// Whether every value is one the mixes can work with.
+    pub fn check(&self) -> Result<(), String> {
+        let share = |name: &str, v: f64| {
+            if (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} must be between 0 and 1, not {v}"))
+            }
+        };
+        share("base_share", self.base_share)?;
+        share("max_artist_share", self.max_artist_share)?;
+        for (name, v) in [
+            ("min_aligned", self.min_aligned),
+            ("min_fit", self.min_fit),
+            ("min_content", self.min_content),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("{name} must be 0 or more, not {v}"));
+            }
+        }
+        if self.max_mixes == 0 {
+            return Err("max_mixes must be at least 1".into());
+        }
+        Ok(())
     }
 }
 
@@ -225,9 +266,10 @@ pub fn recent_artist_mixes_explained(
                 &base[..base_within_cap],
                 &similar[..similar_within_cap],
                 size,
+                tuning.base_share,
             );
             if within.len() < size {
-                fill(&base, &similar, size)
+                fill(&base, &similar, size, tuning.base_share)
             } else {
                 within
             }
@@ -255,27 +297,51 @@ pub fn recent_artist_mixes_explained(
     mixes
 }
 
-/// The mix of up to `size` songs from the base and the similar songs, in the proportion of [`BASE_PER_ROUND`] to
-/// [`ROUND`]: whichever part cannot give its share, the other fills the gap.
-fn fill(base: &[Chosen], similar: &[Chosen], size: usize) -> Vec<Chosen> {
-    let want_base = (size * BASE_PER_ROUND).div_ceil(ROUND);
+/// What a mix of artists is called, after the artists it is built on: the first two of them, by how lately they were played,
+/// and how many more there are (`mix of Queen, David Bowie +1`). The title tells the mix, so two mixes never share one
+/// (their artists are different) and a mix keeps its title while the artist that leads it does.
+pub fn mix_title(library: &[Song], mix: &[Chosen]) -> String {
+    let artist_of: BTreeMap<&str, &str> = library
+        .iter()
+        .map(|s| (s.id.as_str(), s.artist.trim()))
+        .collect();
+    let mut seen = BTreeSet::new();
+    let artists: Vec<&str> = mix
+        .iter()
+        .filter(|c| c.base)
+        .filter_map(|c| artist_of.get(c.id.as_str()).copied())
+        .filter(|a| !a.is_empty() && seen.insert(fold(a)))
+        .collect();
+    match artists.as_slice() {
+        [] => "mix".to_string(),
+        [first, second, rest @ ..] if !rest.is_empty() => {
+            format!("mix of {first}, {second} +{}", rest.len())
+        }
+        some => format!("mix of {}", some.join(", ")),
+    }
+}
+
+/// The mix of up to `size` songs from the base and the similar songs, `base_share` of them from the base: whichever part
+/// cannot give its share, the other fills the gap.
+fn fill(base: &[Chosen], similar: &[Chosen], size: usize, base_share: f64) -> Vec<Chosen> {
+    let want_base = (size as f64 * base_share).ceil() as usize;
     let mut take_base = base.len().min(want_base);
     let take_similar = similar.len().min(size - take_base);
     take_base = base.len().min(size - take_similar);
-    interleave(&base[..take_base], &similar[..take_similar])
+    interleave(&base[..take_base], &similar[..take_similar], base_share)
 }
 
 /// What the mixes and their checks are worked out from: who is who, the tags of the songs and what was heard together.
-struct Basis {
-    clusters: Vec<crate::identity::Cluster>,
+pub(crate) struct Basis {
+    pub(crate) clusters: Vec<crate::identity::Cluster>,
     artist_of_name: BTreeMap<String, usize>,
-    tags: Vec<BTreeSet<String>>,
-    weight: BTreeMap<String, f64>,
+    pub(crate) tags: Vec<BTreeSet<String>>,
+    pub(crate) weight: BTreeMap<String, f64>,
     sittings: Vec<BTreeSet<usize>>,
 }
 
 impl Basis {
-    fn new(
+    pub(crate) fn new(
         library: &[Song],
         played: &[Play],
         decisions: &Decisions,
@@ -320,7 +386,7 @@ impl Basis {
         basis
     }
 
-    fn artist(&self, name: &str) -> Option<usize> {
+    pub(crate) fn artist(&self, name: &str) -> Option<usize> {
         self.artist_of_name.get(&fold(name)).copied()
     }
 
@@ -435,7 +501,7 @@ fn close_artists(
 
 /// The genres (every one the song has), the moods of a song and the crowd tags of its artist, folded. A mood and a genre
 /// of the same name are two tags, and so is a crowd tag (`l:`), which comes from another source.
-fn tags_of(song: &Song, enrichment: &Enrichment) -> BTreeSet<String> {
+pub(crate) fn tags_of(song: &Song, enrichment: &Enrichment) -> BTreeSet<String> {
     let genres: Vec<&str> = if song.genres.is_empty() {
         song.genre.as_deref().into_iter().collect()
     } else {
@@ -569,12 +635,12 @@ fn align(
     }
 }
 
-struct Candidate {
-    chosen: Chosen,
-    artist: Option<usize>,
+pub(crate) struct Candidate {
+    pub(crate) chosen: Chosen,
+    pub(crate) artist: Option<usize>,
     /// The song without what makes it a version of itself (see [`song_key`]): a demo and a live take of one song share it.
-    song: String,
-    score: f64,
+    pub(crate) song: String,
+    pub(crate) score: f64,
 }
 
 /// How much a version of a song already picked lowers the next: a second one counts for a fifth, a third for a ninth.
@@ -583,7 +649,7 @@ const VARIANT_PENALTY: f64 = 4.0;
 /// The artist and title of a song, folded, without the part of the title after ` - ` or in brackets: `Tangled - Demo`,
 /// `Maps - Live In Manchester` and `Magic Dance (Remix)` are versions of `Tangled`, `Maps` and `Magic Dance`. They stay
 /// different songs; this only tells a mix not to fill itself with the variants of one.
-fn song_key(song: &Song) -> String {
+pub(crate) fn song_key(song: &Song) -> String {
     let title = song.title.as_str();
     // A track number the file's tag carries in front of the title (`04 Siguiendo la Luna`) is not part of the song.
     let digits = title.bytes().take_while(u8::is_ascii_digit).count();
@@ -604,7 +670,11 @@ fn song_key(song: &Song) -> String {
 /// so the list mixes artists instead of playing one out, and lowers the versions of the same song much more, so that a
 /// demo, a live take and a remix of one song do not fill it. Only when no song is left within the cap do the artists
 /// that have more songs to give carry on, past it.
-fn pick(mut candidates: Vec<Candidate>, limit: usize, cap: usize) -> (Vec<Chosen>, usize) {
+pub(crate) fn pick(
+    mut candidates: Vec<Candidate>,
+    limit: usize,
+    cap: usize,
+) -> (Vec<Chosen>, usize) {
     let mut picked_from: BTreeMap<usize, usize> = BTreeMap::new();
     let mut picked_versions: BTreeMap<String, usize> = BTreeMap::new();
     let mut list = vec![];
@@ -642,18 +712,23 @@ fn pick(mut candidates: Vec<Candidate>, limit: usize, cap: usize) -> (Vec<Chosen
     (list, within_cap)
 }
 
-/// Rounds of [`BASE_PER_ROUND`] base songs then the rest similar ones; whichever runs out first, the other carries on.
-fn interleave(base: &[Chosen], similar: &[Chosen]) -> Vec<Chosen> {
-    let (mut base, mut similar) = (base.iter(), similar.iter());
+/// The two lists woven so that, at every point, the base songs so far are the share asked for, rounded up (with a share
+/// of 0.4 the order is base, similar, base, similar, similar, and so on); whichever runs out first, the other carries on.
+fn interleave(base: &[Chosen], similar: &[Chosen], base_share: f64) -> Vec<Chosen> {
+    let (mut base, mut similar) = (base.iter().peekable(), similar.iter().peekable());
     let mut list = vec![];
-    loop {
-        let before = list.len();
-        list.extend(base.by_ref().take(BASE_PER_ROUND).cloned());
-        list.extend(similar.by_ref().take(ROUND - BASE_PER_ROUND).cloned());
-        if list.len() == before {
-            return list;
-        }
+    let mut from_base = 0usize;
+    while base.peek().is_some() || similar.peek().is_some() {
+        let due = (base_share * (list.len() + 1) as f64 - 1e-9).ceil() as usize;
+        let next = if (from_base < due && base.peek().is_some()) || similar.peek().is_none() {
+            from_base += 1;
+            base.next()
+        } else {
+            similar.next()
+        };
+        list.extend(next.cloned());
     }
+    list
 }
 
 #[cfg(test)]
@@ -758,14 +833,71 @@ mod tests {
     }
 
     #[test]
-    fn three_of_every_five_songs_are_the_artists_played_and_two_are_similar() {
+    fn two_of_every_five_songs_are_the_artists_played_and_three_are_similar() {
         let mix = &mixes(&sample(), &["Band A"], 5)[0];
         let from_base = |id: &String| id.starts_with('a');
         assert_eq!(mix.len(), 5);
         assert_eq!(
             mix.iter().map(from_base).collect::<Vec<_>>(),
-            [true, true, true, false, false],
+            [true, false, true, false, false],
             "{mix:?}"
+        );
+    }
+
+    #[test]
+    fn the_share_of_the_artists_played_is_a_setting() {
+        let library: Vec<Song> = (0..20)
+            .flat_map(|i| {
+                [
+                    song(&format!("a{i:02}"), &format!("A{i}"), &["Rock"], &[]),
+                    song(&format!("t{i:02}"), &format!("T{i}"), &["Rock"], &[]),
+                ]
+            })
+            .collect();
+        let base_songs = |share: f64| {
+            let tuning = Tuning {
+                base_share: share,
+                max_artist_share: 1.0,
+                ..Tuning::default()
+            };
+            let recent: Vec<String> = (0..4).map(|i| format!("A{i}")).collect();
+            let mixes = recent_artist_mixes_explained(
+                &library,
+                &recent,
+                &[],
+                &Decisions::default(),
+                &Enrichment::default(),
+                10,
+                &tuning,
+            );
+            assert_eq!(mixes[0].len(), 10);
+            mixes[0].iter().filter(|c| c.base).count()
+        };
+        // The four artists played have four songs each between them (a00-a03 only: one song each), so the base is short of
+        // its share when it is large, and the similar songs fill the gap.
+        assert_eq!(base_songs(0.0), 0);
+        assert_eq!(base_songs(0.2), 2);
+        assert_eq!(base_songs(0.4), 4);
+        assert_eq!(
+            base_songs(0.6),
+            4,
+            "only four songs are of the artists played"
+        );
+    }
+
+    #[test]
+    fn the_tuning_is_read_from_json_with_what_is_left_out_as_default() {
+        assert_eq!(Tuning::parse("{}").unwrap(), Tuning::default());
+        let tuning = Tuning::parse(r#"{"base_share": 0.25, "max_mixes": 2}"#).unwrap();
+        assert_eq!((tuning.base_share, tuning.max_mixes), (0.25, 2));
+        assert_eq!(tuning.min_fit, Tuning::default().min_fit);
+        assert!(Tuning::parse(r#"{"base_share": 1.5}"#)
+            .unwrap_err()
+            .contains("base_share"));
+        assert!(Tuning::parse(r#"{"max_mixes": 0}"#).is_err());
+        assert!(
+            Tuning::parse(r#"{"base_shar": 0.5}"#).is_err(),
+            "a typo is an error, not a setting that does nothing"
         );
     }
 
@@ -1311,7 +1443,7 @@ mod tests {
         );
         let (base, similar): (Vec<&Chosen>, Vec<&Chosen>) =
             explained[0].iter().partition(|c| c.base);
-        assert_eq!((base.len(), similar.len()), (3, 2), "{explained:?}");
+        assert_eq!((base.len(), similar.len()), (2, 3), "{explained:?}");
         assert!(base.iter().all(|c| c.tags == 0.0 && c.together == 0.0));
         assert!(
             similar.iter().all(|c| c.tags > 0.99 && c.close == 0.0),

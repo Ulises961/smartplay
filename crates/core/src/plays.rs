@@ -331,6 +331,27 @@ pub fn seed_artists(
     seeds
 }
 
+/// How many times each artist was played, by folded name: what the server counted before the engine heard of any play (the
+/// `baseline`) and the plays of `log` told after it.
+pub fn artist_counts(
+    log: &[Play],
+    baseline: Option<&Baseline>,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    let told_after = baseline.map_or(i64::MIN, |b| b.at);
+    for tally in baseline.iter().flat_map(|b| &b.tallies) {
+        if !tally.artist.trim().is_empty() {
+            *counts.entry(fold(&tally.artist)).or_default() += tally.count as usize;
+        }
+    }
+    for p in log.iter().filter(|p| p.at > told_after) {
+        if let Some(artist) = main_artist(p) {
+            *counts.entry(fold(artist)).or_default() += 1;
+        }
+    }
+    counts
+}
+
 /// Plays further apart than this (their start times) are not part of one sitting. An hour allows for a long track.
 pub const SESSION_GAP: i64 = 60 * 60;
 

@@ -100,7 +100,7 @@ leaves the plugin disabled: enable it again and restart Navidrome.
 In Navidrome, the plugin's settings: engine address `http://smartplay-engine:7788` and the code from the engine's log. Use
 the name, not an IP: an IP set here goes stale when the engine container is recreated, and the plugin then logs `connection
 refused` on every run. Within a minute the plugin sends the library, and `docker logs smartplay-engine` and Navidrome's log say
-so. The playlists `smartplay` and `smartplay: mix 1`/`2` appear for the granted user once there is something to put in them.
+so. The playlists `smartplay`, the mixes of artists played lately and the moods (`smartplay: Focus`, …) appear for the granted user once there is something to put in them.
 
 ## 5. Look at what it does
 
@@ -108,8 +108,11 @@ so. The playlists `smartplay` and `smartplay: mix 1`/`2` appear for the granted 
 docker exec smartplay-engine smartplay-engine eval default USER_NAME --data /state
 ```
 
-`default` is the server's name in the engine and `USER_NAME` the user's name in Navidrome. It prints the seeds, the mixes and
-how well they would have predicted the last two weeks of plays. Nothing is changed.
+`default` is the server's name in the engine and `USER_NAME` the user's name in Navidrome. It prints the seeds, the mixes, the
+mood playlists and how well the mixes would have predicted the last two weeks of plays. Nothing is changed. Add
+`--base-share 0.5` (or `--min-fit`, `--min-content`, `--min-aligned`, `--max-share`, `--max-mixes`) to try another value; once
+you like it, write it in `tuning.json` in `/state` (see the README). `smartplay-engine moods --data /state` prints the moods
+in use, to start a `moods.json` from.
 
 ## 6. History from outside, and what Last.fm knows
 
