@@ -14,9 +14,9 @@ use smartplay_core::{
     mix::{self, Tuning},
     moods::{self, Mood},
     normalize::fold,
+    playlist_name,
     plays::{self, Baseline, Ended, Play},
     taste::Song,
-    PLAYLIST_PREFIX,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -214,7 +214,10 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
         mixes: explained.iter().map(|m| lines(m, &name_of, why)).collect(),
         mix_titles: explained
             .iter()
-            .map(|m| format!("{PLAYLIST_PREFIX}{}", mix::mix_title(library, m)))
+            .map(|m| {
+                let moods: Vec<&str> = moods.iter().map(|m| m.name.as_str()).collect();
+                mix::artist_mix_playlist(library, m, &moods)
+            })
             .collect(),
         mood_mixes: moods::mood_mixes(
             library,
@@ -229,12 +232,7 @@ pub fn evaluate(input: &Input, size: usize, holdout_days: i64) -> Report {
             &tuning,
         )
         .into_iter()
-        .map(|(name, chosen)| {
-            (
-                format!("{PLAYLIST_PREFIX}{name}"),
-                lines(&chosen, &name_of, mood_why),
-            )
-        })
+        .map(|(name, chosen)| (playlist_name(&name), lines(&chosen, &name_of, mood_why)))
         .collect(),
         holdout: None,
         holdout_without_enrichment: None,
@@ -368,7 +366,7 @@ impl Report {
         );
         let _ = writeln!(out, "seeds: {}", self.seeds.join(", "));
         for (i, mix) in self.mixes.iter().enumerate() {
-            let title = self.mix_titles.get(i).map_or("mix", String::as_str);
+            let title = self.mix_titles.get(i).map_or("a mix", String::as_str);
             let _ = writeln!(out, "\n{title} ({} songs)", mix.len());
             if let Some(stats) = self.mix_stats.get(i) {
                 let fit = stats

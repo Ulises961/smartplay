@@ -90,17 +90,18 @@ Star songs in any Subsonic client. Within a minute each granted user finds a pla
 withdraw users in Navidrome's plugin permissions; nothing runs for a user who is not granted.
 
 Play some songs and each user also finds up to three playlists named after the artists they are built on, such as
-`smartplay: mix of Queen, David Bowie +1`, of up to 50 songs each, built from the artists they played last. The recent
+`Queen, David Bowie +1 - Smartplay`, of up to 50 songs each, built from the artists they played last. The recent
 artists are grouped by how well they fit each other, so artists that sound unlike do not share a mix, and one artist does
 not take a mix over. About 40% of a mix are songs of those artists, and 60% are songs of other artists: the ones whose
 genres and moods are close, the ones that outside services (see Last.fm below) call close, and the ones the user tends to
 play in the same sitting (plays less than an hour apart) as the artists of the mix. A song only gets in if it fits well
 enough, so a mix may be shorter than 50 songs rather than filled with weak matches. They work for a user who has starred
 nothing, and they are ordinary playlists too. A mix is named after the artists it is built on, so when the artists played
-lately change, a new playlist appears and the old one stays as it was: delete the ones you do not want.
+lately change, a new playlist appears and the old one stays as it was: delete the ones you do not want. (An artist called
+like a mood, such as a band called `Focus`, gets `Focus (artists) - Smartplay`, so that it does not share the mood's name.)
 
-Beside them, each user gets a playlist for each **mood**: `smartplay: Active`, `smartplay: Classical`, `smartplay: Focus`
-and `smartplay: Hits`. A mood is a recipe of tags (the genres and moods of the songs and what Last.fm says of their
+Beside them, each user gets a playlist for each **mood**: `Active - Smartplay`, `Classical - Smartplay`, `Focus - Smartplay`
+and `Hits - Smartplay`. A mood is a recipe of tags (the genres and moods of the songs and what Last.fm says of their
 artists), and its playlist holds the songs that fit it and nothing else, the artists the user plays more first, with no
 artist taking more than a fifth of it. A mood with fewer than 10 songs that fit gets no playlist. The built-in recipes go by
 genre, because that is what most libraries have: `Classical` is classical music (`Clásica` too), `Focus` is classical,
@@ -133,7 +134,7 @@ and the built-in ones stay in use:
 weights of the tags it has, at most 1), `avoid` rules a song out, `min` is the fit a song needs, `years_back` keeps the songs
 of this many years (this year counts as one), `bpm` is `[low, high]` and `min_popularity` (0 to 1) keeps the songs Last.fm
 counts among that share of the most played, and puts the most played first. A tag matches the song's tag when it is the same or
-one of its words, ignoring case and accents. The playlist is `smartplay: ` and the name.
+one of its words, ignoring case and accents. The playlist is the name and ` - Smartplay`.
 
 What decides the mixes of artists can be tuned too, in `tuning.json` in the same folder (every field is optional, and a value
 that is not valid is reported and the defaults stand in): `base_share` (the share of a mix that is of the artists played, 0.4),

@@ -100,7 +100,7 @@ leaves the plugin disabled: enable it again and restart Navidrome.
 In Navidrome, the plugin's settings: engine address `http://smartplay-engine:7788` and the code from the engine's log. Use
 the name, not an IP: an IP set here goes stale when the engine container is recreated, and the plugin then logs `connection
 refused` on every run. Within a minute the plugin sends the library, and `docker logs smartplay-engine` and Navidrome's log say
-so. The playlists `smartplay`, the mixes of artists played lately and the moods (`smartplay: Focus`, …) appear for the granted user once there is something to put in them.
+so. The playlists `smartplay`, the mixes of artists played lately and the moods (`Focus - Smartplay`, …) appear for the granted user once there is something to put in them.
 
 ## 5. Look at what it does
 

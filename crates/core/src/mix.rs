@@ -297,10 +297,21 @@ pub fn recent_artist_mixes_explained(
     mixes
 }
 
-/// What a mix of artists is called, after the artists it is built on: the first two of them, by how lately they were played,
-/// and how many more there are (`mix of Queen, David Bowie +1`). The title tells the mix, so two mixes never share one
-/// (their artists are different) and a mix keeps its title while the artist that leads it does.
-pub fn mix_title(library: &[Song], mix: &[Chosen]) -> String {
+/// The name of the playlist of a mix of artists: the artists it is built on, the first two of them by how lately they were
+/// played, and how many more there are (`Queen, David Bowie +1 - Smartplay`). Two mixes never share one (their artists are
+/// different). An artist that is called like a mood (a band called `Focus`) would give the mood's name and each would rewrite
+/// the other's playlist every minute, so the title then says what it is: `Focus (artists) - Smartplay`.
+pub fn artist_mix_playlist(library: &[Song], mix: &[Chosen], mood_names: &[&str]) -> String {
+    let title = mix_title(library, mix);
+    if mood_names.iter().any(|m| fold(m) == fold(&title)) {
+        crate::playlist_name(&format!("{title} (artists)"))
+    } else {
+        crate::playlist_name(&title)
+    }
+}
+
+/// The artists a mix is built on, as they name its playlist: `Queen, David Bowie +1`.
+fn mix_title(library: &[Song], mix: &[Chosen]) -> String {
     let artist_of: BTreeMap<&str, &str> = library
         .iter()
         .map(|s| (s.id.as_str(), s.artist.trim()))
@@ -313,11 +324,11 @@ pub fn mix_title(library: &[Song], mix: &[Chosen]) -> String {
         .filter(|a| !a.is_empty() && seen.insert(fold(a)))
         .collect();
     match artists.as_slice() {
-        [] => "mix".to_string(),
+        [] => "Mix".to_string(),
         [first, second, rest @ ..] if !rest.is_empty() => {
-            format!("mix of {first}, {second} +{}", rest.len())
+            format!("{first}, {second} +{}", rest.len())
         }
-        some => format!("mix of {}", some.join(", ")),
+        some => some.join(", "),
     }
 }
 

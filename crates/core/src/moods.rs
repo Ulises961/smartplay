@@ -29,7 +29,7 @@ const FAMILIARITY_WEIGHT: f64 = 0.3;
 /// One mood.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Mood {
-    /// The title: the playlist is `smartplay: NAME`.
+    /// The title: the playlist is `NAME - Smartplay`.
     pub name: String,
     /// Tags that make a song fit, each with how much (above 0, at most 1 is enough on its own). A tag matches a song's tag
     /// when it is the same or one of its words (`classical` matches `modern classical`), ignoring case and accents.
